@@ -2,23 +2,23 @@ use std::{collections::hash_map::Entry, io::Read, net::SocketAddrV4};
 
 use mini_tcp::{
     device::TunDevice,
-    tcp::{SocketPair, Tcb},
+    tcb::{ConnectionError, SocketPair, Tcb},
     TCBTable,
 };
 
-fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut dev = TunDevice::new()?;
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut dev = TunDevice::new().unwrap();
     let mut tcb_table = TCBTable::new();
-    let mut buf = [0; 4096];
+    let mut buf = [0u8; 1500]; // MTU
 
     // What's the next step of the operation?
     loop {
         let amount = dev.read(&mut buf)?;
         let pkt = &buf[0..amount];
+
         if let Ok(ipd) = etherparse::Ipv4HeaderSlice::from_slice(pkt) {
             let src = ipd.source_addr();
             let dest = ipd.destination_addr();
-
             // Reject everything not TCP for now
             if ipd.protocol() != etherparse::IpNumber::TCP {
                 continue;
@@ -36,10 +36,16 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     match tcb_table.connections.entry(sp) {
                         Entry::Vacant(vacant) => {
                             let tcb = Tcb::new(sp);
-                            vacant.insert(tcb).poll(&mut dev, tcp);
+                            vacant.insert(tcb).poll(&mut dev, tcp)?
                         }
                         Entry::Occupied(mut occupied) => {
-                            occupied.get_mut().poll(&mut dev, tcp);
+                            if let Err(
+                                ConnectionError::ConnectionReset
+                                | ConnectionError::ConnectionRefused,
+                            ) = occupied.get_mut().poll(&mut dev, tcp)
+                            {
+                                tcb_table.connections.remove_entry(&sp);
+                            }
                         }
                     }
                 }

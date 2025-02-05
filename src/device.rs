@@ -7,8 +7,6 @@ pub struct TunDevice {
 impl TunDevice {
     pub fn new() -> Result<Self, tun::BoxError> {
         let mut config = tun::Configuration::default();
-
-        // ip address 10.0.0.9
         config
             .address((10, 0, 0, 9))
             .netmask((255, 255, 255, 0))
@@ -18,9 +16,7 @@ impl TunDevice {
         config.platform_config(|config| {
             config.ensure_root_privileges(true);
         });
-
         let inner = tun::create(&config)?;
-
         Ok(Self { inner })
     }
 }
