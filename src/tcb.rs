@@ -1,12 +1,6 @@
-use std::{
-    collections::VecDeque,
-    fmt::Display,
-    io::{Error, ErrorKind, Write},
-    net::SocketAddrV4,
-};
+use std::{collections::VecDeque, io, net::SocketAddrV4};
 
-use crate::device::TunDevice;
-
+/// The state of a TCB, according to RFC 793.
 #[derive(Hash, Eq, PartialEq, Debug)]
 pub enum State {
     Listen,
@@ -22,25 +16,14 @@ pub enum State {
     Closed,
 }
 
-impl Display for State {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            State::Listen => write!(f, "Listen"),
-            State::SynSent => write!(f, "SynSent"),
-            State::SynRcvd => write!(f, "SynRcvd"),
-            State::Estab => write!(f, "Estab"),
-            State::FinWait1 => write!(f, "FinWait1"),
-            State::FinWait2 => write!(f, "FinWait2"),
-            State::CloseWait => write!(f, "CloseWait"),
-            State::Closing => write!(f, "Closing"),
-            State::LastAck => write!(f, "LastAck"),
-            State::TimeWait => write!(f, "TimeWait"),
-            State::Closed => write!(f, "Closed"),
-        }
-    }
+pub enum PollResult {
+    SendDatagram(Vec<u8>),
+    TcbError(io::Error),
+    ShouldRetransmit,
+    NoAction,
 }
 
-// TTL for IPv4
+/// TTL for IPv4
 const HOP_LIMIT: u8 = 64;
 
 #[derive(Hash, Eq, PartialEq, Debug, Clone, Copy)]
@@ -55,11 +38,14 @@ pub enum ConnectionType {
     Passive,
 }
 
-// Transmission Control Block
+/// Transmission Control Block
 #[derive(Hash, Eq, PartialEq, Debug)]
 pub struct Tcb {
+    /// TCB state
     state: State,
+    /// Connection pair
     pair: SocketPair,
+    /// Determines whether it's a client or a server
     connection_type: ConnectionType,
     /// Transmit buffer
     tx_buffer: VecDeque<u8>,
@@ -84,16 +70,18 @@ pub struct Tcb {
     /// Next byte expected from sender
     rcv_nxt: u32,
     /// Available buffer space for receiving
-    rcv_wnd: u32,
+    rcv_wnd: u16,
     /// Used for urgent data
     rcv_up: u32,
+    /// Lost segments detection timeout
+    rto: Option<std::time::Duration>,
 }
 
 impl Tcb {
     pub fn new(pair: SocketPair) -> Self {
         Self {
-            pair,
             state: State::Listen,
+            pair,
             connection_type: ConnectionType::Passive,
             tx_buffer: VecDeque::with_capacity(4096),
             rx_buffer: VecDeque::with_capacity(4096),
@@ -106,39 +94,99 @@ impl Tcb {
             snd_up: 0,
             irs: 0,
             rcv_nxt: 0,
-            rcv_wnd: 0,
+            rcv_wnd: 4096,
             rcv_up: 0,
+            rto: None,
         }
     }
 
-    pub fn poll(
-        &mut self,
-        dev: &mut TunDevice,
-        seg: etherparse::TcpHeaderSlice,
-        payload: &[u8],
-    ) -> std::io::Result<()> {
+    pub fn is_acceptable(&self, seg: &etherparse::TcpHeaderSlice, len: usize) -> bool {
+        // Length  Window        Test
+        // ------- -------  -------------------------------------------
+        //  0        0     SEG.SEQ = RCV.NXT
+        //
+        //  0       >0     RCV.NXT =< SEG.SEQ < RCV.NXT+RCV.WND
+        //
+        // >0        0     not acceptable
+        //
+        //  >0      >0     RCV.NXT =< SEG.SEQ < RCV.NXT+RCV.WND
+        //              or RCV.NXT =< SEG.SEQ+SEG.LEN-1 < RCV.NXT+RCV.WND
+
+        let seg_seq = seg.sequence_number();
+        let seg_len = Self::segment_length(&seg, len);
+        let seg_end = seg_seq.wrapping_add(seg_len - 1);
+        let rcv_win = self.rcv_nxt + self.rcv_wnd as u32;
+
+        match (seg_len, self.rcv_wnd) {
+            (0, 0) => {
+                if seg_seq == self.rcv_nxt {
+                    return true;
+                }
+            }
+            (0, window) if window > 0 => {
+                if self.rcv_nxt <= seg_seq && seg_seq < rcv_win {
+                    return true;
+                }
+            }
+            (length, 0) if length > 0 => return false,
+            (length, window) if length > 0 && window > 0 => {
+                if self.rcv_nxt <= seg_seq && seg_seq < rcv_win
+                    || self.rcv_nxt <= seg_end && seg_end < rcv_win
+                {
+                    return true;
+                }
+            }
+            _ => {
+                unreachable!()
+            }
+        }
+        false
+    }
+
+    pub fn write(&self, tcph: etherparse::TcpHeader, payload: &[u8]) -> PollResult {
+        let builder = etherparse::PacketBuilder::ipv4(
+            self.pair.local.ip().octets(),
+            self.pair.remote.ip().octets(),
+            HOP_LIMIT,
+        )
+        .tcp_header(tcph);
+
+        let mut datagram: Vec<u8> = Vec::<u8>::with_capacity(builder.size(payload.len()));
+
+        match builder.write(&mut datagram, payload) {
+            Ok(_) => PollResult::SendDatagram(datagram),
+            Err(_) => PollResult::TcbError(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "Packet serialization failed",
+            )),
+        }
+    }
+
+    pub fn poll(&mut self, seg: etherparse::TcpHeaderSlice, payload: &[u8]) -> PollResult {
+        if !matches!(self.state, State::Listen | State::SynSent)
+            && !self.is_acceptable(&seg, payload.len())
+        {
+            return self.build_ack();
+        }
+
         match self.state {
-            State::Listen => self.listen(dev, seg),
-            State::SynRcvd => self.syn_rcvd(dev, seg),
-            State::Estab => self.estab(dev, seg, payload),
-            State::Closed => self.close(dev, seg),
-            State::SynSent => self.syn_sent(dev, seg),
-            State::CloseWait => Ok(()),
-            _ => Ok(()),
+            State::Listen => self.listen(seg),
+            State::SynRcvd => self.syn_rcvd(seg),
+            State::Estab => self.estab(seg, payload),
+            State::Closed => self.close(seg, payload),
+            State::SynSent => self.syn_sent(seg),
+            State::CloseWait => self.close_wait(seg),
+            _ => PollResult::NoAction,
         }
     }
 
-    pub fn listen(
-        &mut self,
-        dev: &mut TunDevice,
-        seg: etherparse::TcpHeaderSlice,
-    ) -> std::io::Result<()> {
+    pub fn listen(&mut self, seg: etherparse::TcpHeaderSlice) -> PollResult {
         // RST should be ignored in LISTEN state
         if seg.rst() {
-            return Ok(());
+            return PollResult::NoAction;
         }
         if seg.ack() {
-            self.send_rst(dev, seg.acknowledgment_number())?
+            return self.build_rst(seg.acknowledgment_number());
         }
 
         // Security and precedence checks are skipped
@@ -146,12 +194,11 @@ impl Tcb {
             self.irs = seg.sequence_number();
             self.rcv_nxt = seg.sequence_number().wrapping_add(1);
 
-            let ws = self.window().unwrap();
             let mut tcph = etherparse::TcpHeader::new(
                 self.pair.local.port(),
                 self.pair.remote.port(),
                 self.iss,
-                ws,
+                self.rx_window(),
             );
             tcph.acknowledgment_number = self.rcv_nxt;
             tcph.syn = true;
@@ -162,25 +209,20 @@ impl Tcb {
 
             self.state = State::SynRcvd;
 
-            self.send_datagram(dev, tcph, &[])?
+            return self.write(tcph, &[]);
         }
-        // It's not ok, actually
-        Ok(())
+
+        PollResult::NoAction
     }
 
-    pub fn syn_rcvd(
-        &mut self,
-        dev: &mut TunDevice,
-        seg: etherparse::TcpHeaderSlice,
-    ) -> std::io::Result<()> {
+    pub fn syn_rcvd(&mut self, seg: etherparse::TcpHeaderSlice) -> PollResult {
         if seg.rst() {
             if self.connection_type == ConnectionType::Passive {
                 self.state = State::Listen;
-                return Ok(());
+                return PollResult::NoAction;
             } else {
-                // TODO: The retrasmission queue should be flushed
-                let _ = self.tx_buffer.flush();
-                return Err(Error::from(ErrorKind::ConnectionReset));
+                self.tx_buffer.clear();
+                return PollResult::TcbError(io::Error::from(io::ErrorKind::ConnectionReset));
             }
         }
 
@@ -189,44 +231,38 @@ impl Tcb {
             match seg_ack > self.snd_una && seg_ack <= self.snd_nxt {
                 true => {
                     if seg.rst() {
-                        return Err(Error::from(ErrorKind::ConnectionReset));
+                        return PollResult::TcbError(io::Error::from(
+                            io::ErrorKind::ConnectionReset,
+                        ));
                     }
                     self.state = State::Estab;
                     println!("accepted a connection from: {}", self.pair.remote);
-
-                    // TODO: calculate window size precisely
-                    self.snd_wnd = seg.window_size();
-                    self.snd_wl1 = seg.sequence_number();
-                    self.snd_wl2 = seg.acknowledgment_number();
                 }
                 false => {
-                    self.send_rst(dev, seg.sequence_number())?;
+                    self.build_rst(seg.sequence_number());
                 }
             }
         }
-        Ok(())
+
+        PollResult::NoAction
     }
 
-    pub fn syn_sent(
-        &mut self,
-        dev: &mut TunDevice,
-        seg: etherparse::TcpHeaderSlice,
-    ) -> std::io::Result<()> {
+    pub fn syn_sent(&mut self, seg: etherparse::TcpHeaderSlice) -> PollResult {
         let seg_ack = seg.acknowledgment_number();
         if seg_ack <= self.iss || seg_ack > self.snd_nxt {
             if seg.rst() {
-                return Ok(());
+                return PollResult::NoAction;
             }
-            self.send_rst(dev, seg_ack)?
+            return self.build_rst(seg_ack);
         }
 
         match seg_ack >= self.snd_una && seg_ack <= self.snd_nxt {
             true => {
                 if seg.rst() {
-                    return Err(Error::from(ErrorKind::ConnectionReset));
+                    return PollResult::TcbError(io::Error::from(io::ErrorKind::ConnectionReset));
                 }
             }
-            false => return Ok(()),
+            false => return PollResult::NoAction,
         }
 
         if seg.syn() {
@@ -239,162 +275,120 @@ impl Tcb {
             if self.snd_una > self.iss {
                 self.state = State::Estab;
 
-                let ws = seg.window_size();
-                let mut tcph = etherparse::TcpHeader::new(
+                let mut tcp_header = etherparse::TcpHeader::new(
                     self.pair.local.port(),
                     self.pair.remote.port(),
                     self.snd_nxt,
-                    ws,
+                    self.rx_window(),
                 );
-                tcph.acknowledgment_number = self.rcv_nxt;
-                tcph.ack = true;
+                tcp_header.acknowledgment_number = self.rcv_nxt;
+                tcp_header.ack = true;
 
-                self.send_datagram(dev, tcph, &[])?
+                return self.write(tcp_header, &[]);
             }
         }
-        Ok(())
+
+        PollResult::NoAction
     }
 
-    pub fn send_rst(&mut self, dev: &mut TunDevice, seq: u32) -> std::io::Result<()> {
+    pub fn build_rst(&mut self, seq: u32) -> PollResult {
         let mut tcph =
             etherparse::TcpHeader::new(self.pair.local.port(), self.pair.remote.port(), seq, 0);
         tcph.rst = true;
 
-        self.send_datagram(dev, tcph, &[])
+        self.write(tcph, &[])
     }
 
-    pub fn send_rst_ack(
-        &mut self,
-        dev: &mut TunDevice,
-        seg: etherparse::TcpHeaderSlice,
-    ) -> std::io::Result<()> {
+    pub fn send_rst_ack(&mut self, seq: u32, seg_len: u32) -> PollResult {
         // <SEQ=0><ACK=SEG.SEQ+SEG.LEN><CTL=RST,ACK>
-        let seg_len: u32 = seg.slice().len().try_into().unwrap();
-
         let mut tcph =
             etherparse::TcpHeader::new(self.pair.local.port(), self.pair.remote.port(), 0, 0);
-
-        tcph.acknowledgment_number = seg.sequence_number() + seg_len;
+        tcph.acknowledgment_number = seq.wrapping_add(seg_len);
         tcph.rst = true;
         tcph.ack = true;
 
-        self.send_datagram(dev, tcph, &[])
+        self.write(tcph, &[])
     }
 
-    pub fn estab(
-        &mut self,
-        dev: &mut TunDevice,
-        seg: etherparse::TcpHeaderSlice,
-        payload: &[u8],
-    ) -> std::io::Result<()> {
-        // 1) check sequence number
-        // todo!()
-
-        // 2) check the RST bit,
+    pub fn estab(&mut self, seg: etherparse::TcpHeaderSlice, payload: &[u8]) -> PollResult {
         if seg.rst() {
-            return Err(Error::from(ErrorKind::ConnectionReset));
-        }
-
-        // 3) check security and precedence
-        // todo!()
-
-        // 4) check the SYN bit,
-        // todo!()
-
-        // 5) check the ACK field
-        if seg.ack() {
-            let seg_ack = seg.acknowledgment_number();
-            if self.snd_una < seg_ack && seg_ack <= self.snd_nxt {
-                println!("removing acknowledged octets from tx...");
-                self.snd_una = seg_ack;
-                // TODO: remove acknowledged seqs from tx_buffer. We don't need to store them
-                // anymore.
-            }
-            // todo!()
+            return PollResult::TcbError(io::Error::from(io::ErrorKind::ConnectionReset));
         }
 
         if seg.psh() && !payload.is_empty() {
             self.rx_buffer.extend(payload);
             println!("Received a message: {}", String::from_utf8_lossy(payload));
             self.rcv_nxt = self.rcv_nxt.wrapping_add(payload.len() as u32);
-            self.send_ack(dev)?
+            return self.build_ack();
         }
 
-        if seg.fin() {
-            // Remote socket won't send anymore!
-            println!("connection closing");
+        if seg.ack() {
+            let seg_ack = seg.acknowledgment_number();
+            if self.snd_una < seg_ack && seg_ack <= self.snd_nxt {
+                println!("removing acknowledged octets from tx...");
+                self.snd_una = seg_ack;
+                // TODO: remove acknowledged seqs from tx_buffer.
+            }
+        }
 
+        // Remote socket won't send anymore!
+        if seg.fin() {
+            println!("connection closing");
             self.state = State::CloseWait;
 
             self.rcv_nxt = self.rcv_nxt.wrapping_add(1);
 
-            self.send_ack(dev)?
+            self.build_ack();
 
             // TODO: FIN implies PUSH for any segment text not yet delivered to the user.
         }
 
-        Ok(())
+        PollResult::NoAction
     }
 
-    pub fn close(
-        &mut self,
-        dev: &mut TunDevice,
-        seg: etherparse::TcpHeaderSlice,
-    ) -> std::io::Result<()> {
+    pub fn close(&mut self, seg: etherparse::TcpHeaderSlice, payload: &[u8]) -> PollResult {
         if !seg.rst() {
             match seg.ack() {
-                true => self.send_rst(dev, seg.sequence_number())?,
-                false => self.send_rst_ack(dev, seg)?,
+                true => return self.build_rst(seg.sequence_number()),
+                false => return self.send_rst_ack(seg.sequence_number(), payload.len() as u32),
             }
         }
-        Ok(())
+        PollResult::NoAction
     }
 
-    pub fn close_wait(&mut self, dev: &mut TunDevice) -> std::io::Result<()> {
-        Ok(())
+    pub fn close_wait(&mut self, _seg: etherparse::TcpHeaderSlice) -> PollResult {
+        // TODO: send [FIN,ACK]
+        self.state = State::LastAck;
+        PollResult::NoAction
     }
 
-    pub fn send_ack(&mut self, dev: &mut TunDevice) -> std::io::Result<()> {
-        let ws = self.window().unwrap();
+    pub fn build_ack(&mut self) -> PollResult {
         let mut tcph = etherparse::TcpHeader::new(
             self.pair.local.port(),
             self.pair.remote.port(),
             self.snd_nxt,
-            ws,
+            self.rx_window(),
         );
         tcph.acknowledgment_number = self.rcv_nxt;
         tcph.ack = true;
 
-        self.send_datagram(dev, tcph, &[])
+        self.write(tcph, &[])
     }
 
-    // Update window size based on the rx buffer
-    pub fn window(&self) -> Option<u16> {
-        let ws = self.rx_buffer.capacity() - self.rx_buffer.len();
-        ws.try_into().ok()
-    }
+    pub fn segment_length(seg: &etherparse::TcpHeaderSlice, len: usize) -> u32 {
+        let mut seg_len = len as u32;
 
-    pub fn send_datagram(
-        &self,
-        dev: &mut TunDevice,
-        tcph: etherparse::TcpHeader,
-        payload: &[u8],
-    ) -> std::io::Result<()> {
-        let builder = etherparse::PacketBuilder::ipv4(
-            self.pair.local.ip().octets(),
-            self.pair.remote.ip().octets(),
-            HOP_LIMIT,
-        )
-        .tcp_header(tcph);
-
-        let mut datagram = Vec::<u8>::with_capacity(builder.size(payload.len()));
-
-        match builder.write(&mut datagram, payload) {
-            Ok(_) => dev.write_all(datagram.as_slice()),
-            Err(_) => Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "Packet serialization failed",
-            )),
+        if seg.fin() {
+            seg_len += 1;
         }
+        if seg.syn() {
+            seg_len += 1;
+        }
+
+        seg_len
+    }
+
+    pub fn rx_window(&self) -> u16 {
+        (self.rx_buffer.capacity() - self.rx_buffer.len()) as u16
     }
 }
