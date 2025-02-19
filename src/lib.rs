@@ -1,6 +1,6 @@
 use std::{
     collections::{hash_map::Entry, HashMap},
-    io::{self, Read, Write},
+    io::{self, Read},
     net::SocketAddrV4,
 };
 
@@ -8,6 +8,7 @@ use tcb::{SocketPair, Tcb};
 
 pub mod device;
 pub mod tcb;
+mod timer;
 
 #[derive(Default)]
 pub struct TCBTable {
@@ -22,96 +23,69 @@ impl TCBTable {
     }
 }
 
-pub struct TcpListener {
-    inner: Tcb,
-}
-
-pub struct TcpStream {
-    inner: Tcb,
-}
-
-impl TcpListener {
-    pub fn bind(addr: SocketAddrV4) -> io::Result<TcpListener> {
-        // socket()
-        // bind()
-        // listen()
-
-        todo!()
-    }
-
-    pub fn accept(&self) -> io::Result<(TcpStream, SocketAddrV4)> {
-        todo!()
-    }
-}
-
-impl Read for TcpStream {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        todo!()
-    }
-}
-
-impl Write for TcpStream {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        todo!()
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        todo!()
-    }
-}
-
 pub fn main_loop() -> io::Result<()> {
     let mut dev = device::TunDevice::new().unwrap();
     let mut table = TCBTable::new();
 
-    let mut buf = [0u8; 1500]; // MTU
-    loop {
-        let amount = dev.read(&mut buf)?;
-        let pkt = &buf[0..amount];
+    let ph = std::thread::spawn(move || {
+        let mut buf = [0u8; 1500]; // MTU
+        loop {
+            // TODO: check expired timers, but the read will block
 
-        if let Ok(ipd) = etherparse::Ipv4HeaderSlice::from_slice(pkt) {
-            let src = ipd.source_addr();
-            let dest = ipd.destination_addr();
-            // Reject everything not TCP for now
-            if ipd.protocol() != etherparse::IpNumber::TCP {
-                continue;
-            }
+            let amount = dev.read(&mut buf)?;
+            let pkt = &buf[0..amount];
 
-            let tcp_offset: usize = (ipd.ihl() << 2).into(); // IP header is 4 words long
-            match etherparse::TcpHeaderSlice::from_slice(&pkt[tcp_offset..]) {
-                Ok(tcph) => {
-                    let data_offset: usize = (tcph.data_offset() << 2).into();
-                    let payload = &pkt[tcp_offset + data_offset..];
-                    // Uniquely represents a connection
-                    let sp = SocketPair {
-                        local: SocketAddrV4::new(dest, tcph.destination_port()),
-                        remote: SocketAddrV4::new(src, tcph.source_port()),
-                    };
+            if let Ok(iph) = etherparse::Ipv4HeaderSlice::from_slice(pkt) {
+                let src = iph.source_addr();
+                let dest = iph.destination_addr();
+                // Reject everything not TCP for now
+                if iph.protocol() != etherparse::IpNumber::TCP {
+                    continue;
+                }
 
-                    match table.connections.entry(sp) {
-                        Entry::Vacant(vacant) => {
-                            let tcb = Tcb::new(sp);
-                            match vacant.insert(tcb).poll(tcph, payload) {
-                                tcb::PollResult::SendDatagram(segment) => {
-                                    dev.write_all(segment.as_slice())?
-                                }
-                                _ => {}
+                let tcp_offset: usize = (iph.ihl() << 2).into(); // IP header is 4 words long
+                match etherparse::TcpHeaderSlice::from_slice(&pkt[tcp_offset..]) {
+                    Ok(tcph) => {
+                        let data_offset: usize = (tcph.data_offset() << 2).into();
+                        let payload = &pkt[tcp_offset + data_offset..];
+                        // Uniquely represents a connection
+                        let sp = SocketPair {
+                            local: SocketAddrV4::new(dest, tcph.destination_port()),
+                            remote: SocketAddrV4::new(src, tcph.source_port()),
+                        };
+
+                        match table.connections.entry(sp) {
+                            // Connection didn't exist before
+                            Entry::Vacant(vacant) => {
+                                let tcb = Tcb::new(sp);
+                                vacant.insert(tcb).poll(&mut dev, tcph, payload)?
                             }
-                        }
-                        Entry::Occupied(mut occupied) => {
-                            match occupied.get_mut().poll(tcph, payload) {
-                                tcb::PollResult::SendDatagram(segment) => {
-                                    dev.write_all(segment.as_slice())?
+
+                            // The state is synchronized anyway
+                            Entry::Occupied(mut occupied) => {
+                                if let Err(error) = occupied.get_mut().poll(&mut dev, tcph, payload)
+                                {
+                                    match error.kind() {
+                                        io::ErrorKind::ConnectionRefused
+                                        | io::ErrorKind::ConnectionReset => {
+                                            println!("Removing a connection: {:?}", &sp);
+                                            table.connections.remove_entry(&sp);
+                                        }
+                                        _ => {}
+                                    }
                                 }
-                                _ => {}
                             }
                         }
                     }
+                    Err(e) => println!("Error parsing TCP segment {:?}", e),
                 }
-                Err(e) => println!("Error parsing TCP segment, bruh... {:?}", e),
             }
         }
+        #[allow(unreachable_code)]
+        Ok::<(), io::Error>(())
+    });
 
-        // Poll timers here + on_tick
-    }
+    let _ = ph.join();
+
+    Ok(())
 }
