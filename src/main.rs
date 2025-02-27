@@ -1,15 +1,10 @@
-use std::{
-    collections::hash_map::Entry,
-    io::{self, Read},
-    net::{Ipv4Addr, SocketAddrV4},
-};
+use mini_tcp::{device, packet_loop};
 
-use mini_tcp::{
-    device, main_loop,
-    tcb::{SocketPair, Tcb},
-    TCBTable, TcpListener,
-};
+fn main() -> std::io::Result<()> {
+    let mut dev = device::TunDevice::new().unwrap();
 
-fn main() -> io::Result<()> {
-    main_loop()
+    let ph = std::thread::spawn(move || packet_loop(&mut dev));
+    let _ = ph.join();
+
+    Ok(())
 }

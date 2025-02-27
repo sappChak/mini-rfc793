@@ -1,10 +1,16 @@
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     io::{self, Write},
     net::SocketAddrV4,
 };
 
 use crate::device;
+
+#[derive(Hash, PartialEq, Eq, Debug)]
+struct TimerEntry {
+    expires_at: std::time::Instant,
+    payload_len: usize,
+}
 
 /// The state of a TCB
 #[derive(Hash, Eq, PartialEq, Debug)]
@@ -72,6 +78,10 @@ pub struct Tcb {
     rcv_wnd: u16,
     /// Used for urgent data
     rcv_up: u32,
+    /// RTO in (ms)
+    rto: std::time::Duration,
+    /// Timeouts for the current connection
+    timers: BTreeMap<u32, TimerEntry>,
 }
 
 impl Tcb {
@@ -93,10 +103,62 @@ impl Tcb {
             rcv_nxt: 0,
             rcv_wnd: 4096,
             rcv_up: 0,
+            rto: std::time::Duration::from_millis(200),
+            timers: BTreeMap::new(),
         }
     }
 
-    pub(crate) fn poll(
+    pub fn on_tick(&mut self, dev: &mut device::TunDevice) {
+        let now = std::time::Instant::now();
+
+        if let Some((&snd_una, _)) = self
+            .timers
+            .iter()
+            .find(|(_, timer)| timer.expires_at <= now)
+        {
+            let timer = self.timers.remove(&snd_una).unwrap();
+
+            let prev_nxt = self.snd_nxt.wrapping_sub(timer.payload_len as u32);
+
+            let mut th = etherparse::TcpHeader::new(
+                self.pair.local.port(),
+                self.pair.remote.port(),
+                prev_nxt,
+                self.rcv_wnd,
+            );
+            th.acknowledgment_number = self.rcv_nxt;
+            th.psh = true;
+            th.ack = true;
+
+            let to_write: Vec<u8> = self
+                .tx_buffer
+                .range(0..timer.payload_len)
+                .copied()
+                .collect();
+
+            println!(
+                "retransmitting: {:?}",
+                String::from_utf8_lossy(to_write.as_slice())
+            );
+
+            let _ = self.write_all(dev, th, to_write.as_slice());
+
+            // exponential back-off
+            self.rto *= 2;
+
+            // Restart the timer
+            self.timers.insert(
+                self.snd_una,
+                TimerEntry {
+                    expires_at: std::time::Instant::now() + self.rto,
+                    payload_len: timer.payload_len,
+                },
+            );
+        }
+    }
+
+    /// BASED on RFC793 SEGMENT ARRIVES section
+    pub(crate) fn on_segment(
         &mut self,
         dev: &mut device::TunDevice,
         hdr: etherparse::TcpHeaderSlice,
@@ -170,6 +232,7 @@ impl Tcb {
             let seg_ack = hdr.acknowledgment_number();
             let seg_seq = hdr.sequence_number();
             let seg_wnd = hdr.window_size();
+
             match self.state {
                 State::SynRcvd => match seg_ack > self.snd_una && seg_ack <= self.snd_nxt {
                     true => {
@@ -178,6 +241,7 @@ impl Tcb {
                         }
                         self.state = State::Estab;
                         println!("accepted a connection from: {}", self.pair.remote);
+                        // self.tx_buffer.extend(b"Hello WORLD!!!");
                     }
                     false => {
                         self.write_rst(dev, hdr.sequence_number())?;
@@ -185,20 +249,31 @@ impl Tcb {
                 },
                 State::Estab | State::CloseWait => {
                     if self.snd_una < seg_ack && seg_ack <= self.snd_nxt {
+                        println!("received ACK, shifting snd_una...");
                         self.snd_una = seg_ack;
 
-                        // TODO: remove acknowledged seqs from tx_buffer.
-                        let una_index = (self.snd_una - self.iss - 1) as usize;
+                        // it's possible that not everything was acknowledged
+                        let ack_idx = (seg_ack - self.iss - 1) as usize;
+
                         println!(
-                            "una_index: {}, tx_buffer len: {}",
-                            una_index,
+                            "ack_index: {}, tx_buffer len: {}",
+                            ack_idx,
                             self.tx_buffer.len()
                         );
 
-                        // Remove everything up to SND.UNA
-                        self.tx_buffer.drain(0..una_index.min(self.tx_buffer.len()));
+                        // remove everything up to seg_ack
+                        self.tx_buffer.drain(0..ack_idx.min(self.tx_buffer.len()));
 
-                        // Updating the window from send sequence space
+                        // cancel the retransmit timer associated with the snd_una
+                        if let Some((&key, _)) =
+                            self.timers.iter().find(|(&snd_una, _)| snd_una <= seg_ack)
+                        {
+                            self.timers.remove(&key).unwrap();
+                            self.rto = std::time::Duration::from_millis(200);
+                            println!("canceled RTO for: {}", key);
+                        }
+
+                        // updating the window from send sequence space
                         if self.snd_wl1 < seg_seq
                             || (self.snd_wl1 == seg_seq && self.snd_wl2 <= seg_ack)
                         {
@@ -275,6 +350,7 @@ impl Tcb {
                 self.write_ack(dev)?;
             }
 
+            // transmitting data
             if !self.tx_buffer.is_empty() {
                 let mut th = etherparse::TcpHeader::new(
                     self.pair.local.port(),
@@ -286,12 +362,29 @@ impl Tcb {
                 th.psh = true;
                 th.ack = true;
 
-                let (first, _second) = self.tx_buffer.as_slices();
-                self.write_all(dev, th, first)?;
-                // TODO: start the RTO
+                // TODO: fix this embarrassment
+                let (head, _) = self.tx_buffer.as_slices();
+                self.write_all(dev, th, head)?;
+
+                println!(
+                    "sending data: {:?}\nsnd_una: {}, snd_nxt: {}",
+                    String::from_utf8_lossy(head),
+                    self.snd_una,
+                    self.snd_nxt
+                );
+
+                // TODO: schedule the RTO, be ready to retransmit everything starting from snd.una
+                self.timers.insert(
+                    self.snd_una,
+                    TimerEntry {
+                        expires_at: std::time::Instant::now() + self.rto,
+                        payload_len: head.len(),
+                    },
+                );
 
                 // When the sender creates a segment and transmits it the sender advances SND.NXT
-                self.snd_nxt = self.snd_nxt.wrapping_add(first.len() as u32);
+                self.snd_nxt = self.snd_nxt.wrapping_add(head.len() as u32);
+                println!("snd_nxt changed: {}", self.snd_nxt);
             }
         }
 
@@ -456,7 +549,7 @@ impl Tcb {
         seg_len
     }
 
-    fn is_acceptable(&self, hrd: &etherparse::TcpHeaderSlice, len: usize) -> bool {
+    fn is_acceptable(&self, hdr: &etherparse::TcpHeaderSlice, len: usize) -> bool {
         // Length  Window        Test
         // ------- -------  -------------------------------------------
         //  0        0     SEG.SEQ = RCV.NXT
@@ -468,8 +561,8 @@ impl Tcb {
         //  >0      >0     RCV.NXT =< SEG.SEQ < RCV.NXT+RCV.WND
         //              or RCV.NXT =< SEG.SEQ+SEG.LEN-1 < RCV.NXT+RCV.WND
 
-        let seg_seq = hrd.sequence_number();
-        let seg_len = Self::segment_length(hrd, len);
+        let seg_seq = hdr.sequence_number();
+        let seg_len = Self::segment_length(hdr, len);
         let seg_end = seg_seq.wrapping_add(seg_len - 1);
         let rcv_win = self.rcv_nxt + self.rcv_wnd as u32;
 
