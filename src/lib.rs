@@ -1,43 +1,116 @@
 use std::{
-    collections::{hash_map::Entry, HashMap},
+    collections::{hash_map::Entry, HashMap, VecDeque},
     io::{self, Read},
     net::SocketAddrV4,
+    sync::{Arc, Condvar, Mutex},
 };
 
-use tcb::{SocketPair, Tcb};
-
+use tcb::{ConnectionPair, Socket};
 pub mod device;
 pub mod tcb;
 
-#[derive(Default)]
-pub struct TCBTable {
-    pub(crate) connections: HashMap<SocketPair, Tcb>,
+pub struct Connections {
+    pub connections: HashMap<ConnectionPair, Socket>,
+    pub pending: VecDeque<ConnectionPair>,
 }
 
-impl TCBTable {
+impl Connections {
     pub fn new() -> Self {
         Self {
             connections: HashMap::new(),
+            pending: VecDeque::new(),
         }
     }
 }
 
-pub fn packet_loop(dev: &mut device::TunDevice) -> io::Result<()> {
-    let mut table = TCBTable::new();
-    let mut buf = [0u8; 1500]; // MTU
+pub struct ConnectionManager {
+    pub connections: Mutex<Connections>,
+    pub pending_cvar: Condvar,
+}
 
-    loop {
-        // check timers for each connection
-        for tcb in table.connections.values_mut() {
-            tcb.on_tick(dev);
+impl ConnectionManager {
+    pub fn new() -> Self {
+        Self {
+            connections: Mutex::new(Connections::new()),
+            pending_cvar: Condvar::new(),
         }
+    }
+}
 
+pub struct TcpListener {
+    inner: Arc<ConnectionManager>,
+}
+
+impl TcpListener {
+    pub fn bind(addr: SocketAddrV4) -> io::Result<TcpListener> {
+        let mut dev = device::TunDevice::new().unwrap();
+        let mgr = Arc::new(ConnectionManager::new());
+
+        let mut sock = Socket::new(addr);
+        sock.listen();
+
+        let mgr_ref = Arc::clone(&mgr);
+        let _h = std::thread::spawn(move || {
+            if let Err(e) = packet_loop(&mut dev, mgr_ref) {
+                eprintln!("error spawning thread: {}", e);
+            }
+        });
+
+        Ok(TcpListener { inner: mgr.clone() })
+    }
+
+    pub fn accept(&mut self) -> io::Result<(TcpStream, SocketAddrV4)> {
+        loop {
+            let mut mgr = self.inner.connections.lock().unwrap();
+            while mgr.pending.is_empty() {
+                mgr = self.inner.pending_cvar.wait(mgr).unwrap();
+            }
+            println!("received notify from the packet_loop");
+            if let Some(cp) = mgr.pending.pop_front() {
+                if let Some(sock) = mgr.connections.get_mut(&cp) {
+                    let sock = sock.accept()?;
+                    let addr = sock.remote().unwrap();
+                    return Ok((TcpStream { inner: sock }, addr));
+                }
+            }
+        }
+    }
+}
+
+pub struct TcpStream {
+    inner: Socket,
+}
+
+impl TcpStream {
+    pub fn connect(_addr: SocketAddrV4) -> io::Result<TcpStream> {
+        unimplemented!()
+    }
+
+    pub fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.inner.read(buf)
+    }
+
+    pub fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.inner.write(buf)
+    }
+}
+
+pub fn packet_loop(dev: &mut device::TunDevice, manager: Arc<ConnectionManager>) -> io::Result<()> {
+    let mut buf = [0u8; 1500]; // MTU
+    loop {
+        {
+            let mut mgr = manager.connections.lock().unwrap();
+            for tcb in mgr.connections.values_mut() {
+                tcb.on_tick(dev)?;
+            }
+        }
         match dev.read(&mut buf) {
             Ok(n) => {
                 let pkt = &buf[0..n];
                 if let Ok(iph) = etherparse::Ipv4HeaderSlice::from_slice(pkt) {
                     let src = iph.source_addr();
                     let dest = iph.destination_addr();
+
                     // Reject everything not TCP for now
                     if iph.protocol() != etherparse::IpNumber::TCP {
                         continue;
@@ -48,29 +121,28 @@ pub fn packet_loop(dev: &mut device::TunDevice) -> io::Result<()> {
                         Ok(tcph) => {
                             let data_offset: usize = (tcph.data_offset() << 2).into();
                             let payload = &pkt[tcp_offset + data_offset..];
-                            // Uniquely represents a connection
-                            let sp = SocketPair {
+
+                            /* Uniquely represents a connection */
+                            let cp = ConnectionPair {
                                 local: SocketAddrV4::new(dest, tcph.destination_port()),
                                 remote: SocketAddrV4::new(src, tcph.source_port()),
                             };
 
-                            match table.connections.entry(sp) {
-                                // Connection didn't exist before
+                            let mut conns_lock = manager.connections.lock().unwrap();
+                            match conns_lock.connections.entry(cp) {
                                 Entry::Vacant(vacant) => {
-                                    let tcb = vacant.insert(Tcb::new(sp));
-                                    tcb.on_segment(dev, tcph, payload)?
+                                    conns_lock.pending.push_back(cp);
+                                    manager.pending_cvar.notify_one();
                                 }
-
-                                // The state is synchronized anyway
                                 Entry::Occupied(mut occupied) => {
                                     if let Err(error) =
-                                        occupied.get_mut().on_segment(dev, tcph, payload)
+                                        occupied.get_mut().on_segment(dev, cp.remote, tcph, payload)
                                     {
                                         match error.kind() {
                                             io::ErrorKind::ConnectionRefused
                                             | io::ErrorKind::ConnectionReset => {
-                                                println!("Removing a connection: {:?}", &sp);
-                                                table.connections.remove_entry(&sp);
+                                                println!("removing a connection: {:?}", &cp);
+                                                conns_lock.connections.remove(&cp);
                                             }
                                             _ => {}
                                         }
@@ -78,7 +150,7 @@ pub fn packet_loop(dev: &mut device::TunDevice) -> io::Result<()> {
                                 }
                             }
                         }
-                        Err(e) => println!("Error parsing TCP segment {:?}", e),
+                        Err(e) => println!("error parsing TCP segment {:?}", e),
                     }
                 }
             }

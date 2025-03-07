@@ -2,13 +2,23 @@ use std::{
     collections::{BTreeMap, VecDeque},
     io::{self, Write},
     net::SocketAddrV4,
+    sync::{Condvar, Mutex},
+    time::{Duration, Instant},
 };
 
 use crate::device;
 
+#[derive(Default)]
+struct TcpFlags {
+    syn: bool,
+    psh: bool,
+    rst: bool,
+}
+
 #[derive(Hash, PartialEq, Eq, Debug)]
 struct TimerEntry {
-    expires_at: std::time::Instant,
+    expires_at: Instant,
+    snd_nxt: u32,
     payload_len: usize,
 }
 
@@ -32,26 +42,29 @@ pub enum State {
 const HOP_LIMIT: u8 = 64;
 
 #[derive(Hash, Eq, PartialEq, Debug, Clone, Copy)]
-pub struct SocketPair {
+pub struct ConnectionPair {
     pub local: SocketAddrV4,
     pub remote: SocketAddrV4,
 }
 
-#[derive(Hash, Eq, PartialEq, Debug)]
+#[derive(Eq, PartialEq, Debug)]
 pub enum ConnectionType {
     Active,
     Passive,
 }
 
 /// Transmission Control Block
-#[derive(Hash, Eq, PartialEq, Debug)]
-pub struct Tcb {
+pub struct Socket {
     /// TCB state
     state: State,
-    /// Connection pair
-    pair: SocketPair,
+    /// Local address specified with listen()
+    listen_addr: SocketAddrV4,
+    /// Remote address obtained in listen
+    remote_addr: Option<SocketAddrV4>,
     /// Determines whether it's a client or a server
     connection_type: ConnectionType,
+    /// Queue of pending connection requests
+    pending: Option<(Mutex<VecDeque<Socket>>, Condvar)>,
     /// Transmit buffer
     pub(crate) tx_buffer: VecDeque<u8>,
     /// Receive buffer
@@ -79,16 +92,16 @@ pub struct Tcb {
     /// Used for urgent data
     rcv_up: u32,
     /// RTO in (ms)
-    rto: std::time::Duration,
+    rto: Duration,
     /// Timeouts for the current connection
     timers: BTreeMap<u32, TimerEntry>,
 }
 
-impl Tcb {
-    pub fn new(pair: SocketPair) -> Self {
+impl Socket {
+    pub fn new(addr: SocketAddrV4) -> Self {
         Self {
-            state: State::Listen,
-            pair,
+            state: State::Closed,
+            listen_addr: addr,
             connection_type: ConnectionType::Passive,
             tx_buffer: VecDeque::with_capacity(4096),
             rx_buffer: VecDeque::with_capacity(4096),
@@ -103,13 +116,48 @@ impl Tcb {
             rcv_nxt: 0,
             rcv_wnd: 4096,
             rcv_up: 0,
-            rto: std::time::Duration::from_millis(200),
+            rto: Duration::from_millis(200),
             timers: BTreeMap::new(),
+            pending: None,
+            remote_addr: None,
         }
     }
 
-    pub fn on_tick(&mut self, dev: &mut device::TunDevice) {
-        let now = std::time::Instant::now();
+    pub fn listen(&mut self) {
+        self.state = State::Listen;
+        self.pending = Some((Mutex::new(VecDeque::new()), Condvar::new()));
+    }
+
+    pub fn remote(&self) -> Option<SocketAddrV4> {
+        self.remote_addr
+    }
+
+    pub fn set_remote(&mut self, remote: SocketAddrV4) {
+        self.remote_addr = Some(remote);
+    }
+
+    pub fn accept(&mut self) -> io::Result<Socket> {
+        if self.state != State::Listen {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "not listening"));
+        }
+        let (lock, cvar) = self.pending.as_ref().unwrap();
+        let mut queue = lock.lock().unwrap();
+        while queue.is_empty() {
+            queue = cvar.wait(queue).unwrap();
+        }
+        Ok(queue.pop_front().unwrap())
+    }
+
+    pub fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        todo!()
+    }
+
+    pub fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        todo!()
+    }
+
+    pub fn on_tick(&mut self, dev: &mut device::TunDevice) -> io::Result<()> {
+        let now = Instant::now();
 
         if let Some((&snd_una, _)) = self
             .timers
@@ -117,18 +165,6 @@ impl Tcb {
             .find(|(_, timer)| timer.expires_at <= now)
         {
             let timer = self.timers.remove(&snd_una).unwrap();
-
-            let prev_nxt = self.snd_nxt.wrapping_sub(timer.payload_len as u32);
-
-            let mut th = etherparse::TcpHeader::new(
-                self.pair.local.port(),
-                self.pair.remote.port(),
-                prev_nxt,
-                self.rcv_wnd,
-            );
-            th.acknowledgment_number = self.rcv_nxt;
-            th.psh = true;
-            th.ack = true;
 
             let to_write: Vec<u8> = self
                 .tx_buffer
@@ -141,52 +177,65 @@ impl Tcb {
                 String::from_utf8_lossy(to_write.as_slice())
             );
 
-            let _ = self.write_all(dev, th, to_write.as_slice());
+            let flags = TcpFlags {
+                psh: true,
+                ..Default::default()
+            };
+
+            self.write_all(
+                dev,
+                timer.snd_nxt,
+                Some(self.rcv_nxt),
+                flags,
+                to_write.as_slice(),
+            )?;
 
             // exponential back-off
             self.rto *= 2;
 
             // Restart the timer
             self.timers.insert(
-                self.snd_una,
+                snd_una,
                 TimerEntry {
-                    expires_at: std::time::Instant::now() + self.rto,
+                    expires_at: Instant::now() + self.rto,
+                    snd_nxt: timer.snd_nxt,
                     payload_len: timer.payload_len,
                 },
             );
         }
+        Ok(())
     }
 
-    /// BASED on RFC793 SEGMENT ARRIVES section
     pub(crate) fn on_segment(
         &mut self,
         dev: &mut device::TunDevice,
-        hdr: etherparse::TcpHeaderSlice,
+        remote: SocketAddrV4,
+        tcph: etherparse::TcpHeaderSlice,
         payload: &[u8],
     ) -> io::Result<()> {
         // Try to establish a connection
         match self.state {
             State::Listen => {
-                return self.process_listen(dev, hdr);
+                return self.process_listen(dev, remote, tcph);
             }
             State::SynSent => {
-                return self.process_syn_sent(dev, hdr);
+                return self.process_syn_sent(dev, tcph);
             }
             State::Closed => {
-                return self.process_close(dev, hdr, payload);
+                return self.process_close(dev, tcph, payload);
             }
             _ => {}
         }
 
         // check sequence number
         if !matches!(self.state, State::Listen | State::SynSent | State::Closed)
-            && !self.is_acceptable(&hdr, payload.len())
+            && !self.is_acceptable(&tcph, payload.len())
         {
             self.write_ack(dev)?;
         }
 
         // check the RST bit
-        if hdr.rst() {
+        if tcph.rst() {
             match self.state {
                 State::SynRcvd => {
                     if self.connection_type == ConnectionType::Passive {
@@ -214,7 +263,7 @@ impl Tcb {
         // check security and precedence
 
         // check the SYN bit
-        if hdr.syn() {
+        if tcph.syn() {
             if !matches!(self.state, State::Closed | State::SynSent) {
                 // If the SYN is in the window it is an error, send a reset, any
                 // outstanding RECEIVEs and SEND should receive "reset" responses,
@@ -228,23 +277,23 @@ impl Tcb {
             }
         }
 
-        if hdr.ack() {
-            let seg_ack = hdr.acknowledgment_number();
-            let seg_seq = hdr.sequence_number();
-            let seg_wnd = hdr.window_size();
+        if tcph.ack() {
+            let seg_ack = tcph.acknowledgment_number();
+            let seg_seq = tcph.sequence_number();
+            let seg_wnd = tcph.window_size();
 
             match self.state {
                 State::SynRcvd => match seg_ack > self.snd_una && seg_ack <= self.snd_nxt {
                     true => {
-                        if hdr.rst() {
+                        if tcph.rst() {
                             return Err(io::Error::from(io::ErrorKind::ConnectionReset));
                         }
                         self.state = State::Estab;
-                        println!("accepted a connection from: {}", self.pair.remote);
-                        // self.tx_buffer.extend(b"Hello WORLD!!!");
+                        // println!("accepted a connection from: {}", self.pair.remote);
+                        self.tx_buffer.extend(b"Hello WORLD!!!");
                     }
                     false => {
-                        self.write_rst(dev, hdr.sequence_number())?;
+                        self.write_rst(dev, tcph.sequence_number())?;
                     }
                 },
                 State::Estab | State::CloseWait => {
@@ -269,7 +318,7 @@ impl Tcb {
                             self.timers.iter().find(|(&snd_una, _)| snd_una <= seg_ack)
                         {
                             self.timers.remove(&key).unwrap();
-                            self.rto = std::time::Duration::from_millis(200);
+                            self.rto = Duration::from_millis(200);
                             println!("canceled RTO for: {}", key);
                         }
 
@@ -333,7 +382,7 @@ impl Tcb {
             return Ok(());
         }
 
-        if hdr.urg() {
+        if tcph.urg() {
             unimplemented!()
         }
 
@@ -352,19 +401,15 @@ impl Tcb {
 
             // transmitting data
             if !self.tx_buffer.is_empty() {
-                let mut th = etherparse::TcpHeader::new(
-                    self.pair.local.port(),
-                    self.pair.remote.port(),
-                    self.snd_nxt,
-                    self.rcv_wnd,
-                );
-                th.acknowledgment_number = self.rcv_nxt;
-                th.psh = true;
-                th.ack = true;
-
                 // TODO: fix this embarrassment
                 let (head, _) = self.tx_buffer.as_slices();
-                self.write_all(dev, th, head)?;
+
+                let flags = TcpFlags {
+                    psh: true,
+                    ..Default::default()
+                };
+
+                self.write_all(dev, self.snd_nxt, Some(self.rcv_nxt), flags, head)?;
 
                 println!(
                     "sending data: {:?}\nsnd_una: {}, snd_nxt: {}",
@@ -377,7 +422,8 @@ impl Tcb {
                 self.timers.insert(
                     self.snd_una,
                     TimerEntry {
-                        expires_at: std::time::Instant::now() + self.rto,
+                        expires_at: Instant::now() + self.rto,
+                        snd_nxt: self.snd_nxt,
                         payload_len: head.len(),
                     },
                 );
@@ -389,7 +435,7 @@ impl Tcb {
         }
 
         // TODO: eighth, check the FIN bit
-        if hdr.fin() {
+        if tcph.fin() {
             // SEG.SEQ cannot be validated in CLOSED, LISTEN or SYN-SENT
             if !matches!(self.state, State::Closed | State::Listen | State::SynSent) {
                 println!("Connection closing");
@@ -433,6 +479,7 @@ impl Tcb {
     fn process_listen(
         &mut self,
         dev: &mut device::TunDevice,
+        remote: SocketAddrV4,
         hdr: etherparse::TcpHeaderSlice,
     ) -> io::Result<()> {
         // RST should be ignored in LISTEN state
@@ -443,29 +490,33 @@ impl Tcb {
             return self.write_rst(dev, hdr.acknowledgment_number());
         }
 
-        // Security and precedence checks are skipped
-        if hdr.syn() {
-            self.irs = hdr.sequence_number();
-            self.rcv_nxt = hdr.sequence_number().wrapping_add(1);
-            self.rcv_wnd = self.rx_window();
-
-            let mut th = etherparse::TcpHeader::new(
-                self.pair.local.port(),
-                self.pair.remote.port(),
-                self.iss,
-                self.rcv_wnd,
-            );
-            th.acknowledgment_number = self.rcv_nxt;
-            th.syn = true;
-            th.ack = true;
-
-            self.snd_una = self.iss;
-            self.snd_nxt = self.iss.wrapping_add(1);
-
-            self.state = State::SynRcvd;
-
-            return self.write_all(dev, th, &[]);
+        if !hdr.syn() {
+            return Ok(());
         }
+
+        // Security and precedence checks are skipped
+        let mut sock = Socket::new(self.listen_addr);
+        sock.listen();
+        sock.remote_addr = Some(remote);
+        sock.connection_type = ConnectionType::Passive;
+        sock.irs = hdr.sequence_number();
+        sock.rcv_nxt = hdr.sequence_number().wrapping_add(1);
+        sock.rcv_wnd = sock.rx_window();
+        sock.snd_una = sock.iss;
+        sock.snd_nxt = sock.iss.wrapping_add(1);
+        sock.state = State::SynRcvd;
+
+        let flags = TcpFlags {
+            syn: true,
+            ..Default::default()
+        };
+        sock.write_all(dev, sock.iss, Some(sock.rcv_nxt), flags, &[])?;
+
+        // Notify that we got an inbound connection
+        let (lock, cvar) = self.pending.as_ref().unwrap();
+        let mut queue = lock.lock().unwrap();
+        queue.push_back(sock);
+        cvar.notify_one();
 
         Ok(())
     }
@@ -501,17 +552,13 @@ impl Tcb {
 
             if self.snd_una > self.iss {
                 self.state = State::Estab;
-
-                let mut th = etherparse::TcpHeader::new(
-                    self.pair.local.port(),
-                    self.pair.remote.port(),
+                return self.write_all(
+                    dev,
                     self.snd_nxt,
-                    self.rx_window(),
+                    Some(self.rcv_nxt),
+                    TcpFlags::default(),
+                    &[],
                 );
-                th.acknowledgment_number = self.rcv_nxt;
-                th.ack = true;
-
-                return self.write_all(dev, th, &[]);
             }
         }
 
@@ -597,24 +644,22 @@ impl Tcb {
     }
 
     fn write_ack(&mut self, dev: &mut device::TunDevice) -> io::Result<()> {
-        let mut th = etherparse::TcpHeader::new(
-            self.pair.local.port(),
-            self.pair.remote.port(),
+        self.write_all(
+            dev,
             self.snd_nxt,
-            self.rcv_wnd,
-        );
-        th.acknowledgment_number = self.rcv_nxt;
-        th.ack = true;
-
-        self.write_all(dev, th, &[])
+            Some(self.rcv_nxt),
+            TcpFlags::default(),
+            &[],
+        )
     }
 
     fn write_rst(&mut self, dev: &mut device::TunDevice, seq: u32) -> io::Result<()> {
-        let mut th =
-            etherparse::TcpHeader::new(self.pair.local.port(), self.pair.remote.port(), seq, 0);
-        th.rst = true;
-
-        self.write_all(dev, th, &[])
+        self.rcv_wnd = 0;
+        let flags = TcpFlags {
+            rst: true,
+            ..Default::default()
+        };
+        self.write_all(dev, seq, None, flags, &[])
     }
 
     fn write_rst_ack(
@@ -624,27 +669,44 @@ impl Tcb {
         seg_len: u32,
     ) -> io::Result<()> {
         // <SEQ=0><ACK=SEG.SEQ+SEG.LEN><CTL=RST,ACK>
-        let mut th =
-            etherparse::TcpHeader::new(self.pair.local.port(), self.pair.remote.port(), 0, 0);
-        th.acknowledgment_number = seq.wrapping_add(seg_len);
-        th.rst = true;
-        th.ack = true;
-
-        self.write_all(dev, th, &[])
+        let flags = TcpFlags {
+            rst: true,
+            ..Default::default()
+        };
+        self.rcv_wnd = 0;
+        self.write_all(dev, 0, Some(seq.wrapping_add(seg_len)), flags, &[])
     }
 
     fn write_all(
         &self,
         dev: &mut device::TunDevice,
-        hdr: etherparse::TcpHeader,
+        seq: u32,
+        ack: Option<u32>,
+        flags: TcpFlags,
         payload: &[u8],
     ) -> io::Result<()> {
+        let mut th = etherparse::TcpHeader::new(
+            self.listen_addr.port(),
+            self.remote_addr.unwrap().port(),
+            seq,
+            self.rcv_wnd,
+        );
+
+        if let Some(ack_num) = ack {
+            th.acknowledgment_number = ack_num;
+            th.ack = true;
+        }
+
+        th.syn = flags.syn;
+        th.psh = flags.psh;
+        th.rst = flags.rst;
+
         let builder = etherparse::PacketBuilder::ipv4(
-            self.pair.local.ip().octets(),
-            self.pair.remote.ip().octets(),
+            self.listen_addr.ip().octets(),
+            self.remote_addr.unwrap().ip().octets(),
             HOP_LIMIT,
         )
-        .tcp_header(hdr);
+        .tcp_header(th);
 
         let mut datagram = Vec::<u8>::with_capacity(builder.size(payload.len()));
 

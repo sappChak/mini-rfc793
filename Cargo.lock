@@ -302,8 +302,8 @@ name = "mini-tcp"
 version = "0.1.0"
 dependencies = [
  "etherparse",
+ "libc",
  "rand",
- "thiserror",
  "tun",
 ]
 
