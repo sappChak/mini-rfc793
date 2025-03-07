@@ -10,7 +10,9 @@ pub mod device;
 pub mod tcb;
 
 pub struct Connections {
+    /// All connections
     pub connections: HashMap<ConnectionPair, Socket>,
+    /// Sockets in established state
     pub pending: VecDeque<ConnectionPair>,
 }
 
@@ -45,10 +47,6 @@ impl TcpListener {
     pub fn bind(addr: SocketAddrV4) -> io::Result<TcpListener> {
         let mut dev = device::TunDevice::new().unwrap();
         let mgr = Arc::new(ConnectionManager::new());
-
-        let mut sock = Socket::new(addr);
-        sock.listen();
-
         let mgr_ref = Arc::clone(&mgr);
         let _h = std::thread::spawn(move || {
             if let Err(e) = packet_loop(&mut dev, mgr_ref) {
@@ -131,12 +129,15 @@ pub fn packet_loop(dev: &mut device::TunDevice, manager: Arc<ConnectionManager>)
                             let mut conns_lock = manager.connections.lock().unwrap();
                             match conns_lock.connections.entry(cp) {
                                 Entry::Vacant(vacant) => {
-                                    conns_lock.pending.push_back(cp);
-                                    manager.pending_cvar.notify_one();
+                                    if let Some(sock) = Socket::try_accept(dev, &tcph, cp)? {
+                                        vacant.insert(sock);
+                                        conns_lock.pending.push_back(cp);
+                                        manager.pending_cvar.notify_one();
+                                    }
                                 }
                                 Entry::Occupied(mut occupied) => {
                                     if let Err(error) =
-                                        occupied.get_mut().on_segment(dev, cp.remote, tcph, payload)
+                                        occupied.get_mut().on_segment(dev, tcph, payload)
                                     {
                                         match error.kind() {
                                             io::ErrorKind::ConnectionRefused

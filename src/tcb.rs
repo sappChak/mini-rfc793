@@ -136,16 +136,35 @@ impl Socket {
         self.remote_addr = Some(remote);
     }
 
-    pub fn accept(&mut self) -> io::Result<Socket> {
-        if self.state != State::Listen {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "not listening"));
+    // half-establish a connection
+    pub fn try_accept(
+        dev: &mut device::TunDevice,
+        hdr: &etherparse::TcpHeaderSlice,
+        cp: ConnectionPair,
+    ) -> io::Result<Option<Socket>> {
+        // Security and precedence checks are skipped
+        let mut sock = Socket::new(cp.local);
+        if hdr.ack() {
+            sock.write_rst(dev, hdr.acknowledgment_number());
         }
-        let (lock, cvar) = self.pending.as_ref().unwrap();
-        let mut queue = lock.lock().unwrap();
-        while queue.is_empty() {
-            queue = cvar.wait(queue).unwrap();
+        if hdr.syn() {
+            sock.listen();
+            sock.remote_addr = Some(cp.remote);
+            sock.connection_type = ConnectionType::Passive;
+            sock.irs = hdr.sequence_number();
+            sock.rcv_nxt = hdr.sequence_number().wrapping_add(1);
+            sock.rcv_wnd = sock.rx_window();
+            sock.snd_una = sock.iss;
+            sock.snd_nxt = sock.iss.wrapping_add(1);
+            sock.state = State::SynRcvd;
+
+            let flags = TcpFlags {
+                syn: true,
+                ..Default::default()
+            };
+            sock.write_all(dev, sock.iss, Some(sock.rcv_nxt), flags, &[])?;
         }
-        Ok(queue.pop_front().unwrap())
+        Ok(None)
     }
 
     pub fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
@@ -209,15 +228,11 @@ impl Socket {
     pub(crate) fn on_segment(
         &mut self,
         dev: &mut device::TunDevice,
-        remote: SocketAddrV4,
         tcph: etherparse::TcpHeaderSlice,
         payload: &[u8],
     ) -> io::Result<()> {
         // Try to establish a connection
         match self.state {
-            State::Listen => {
-                return self.process_listen(dev, remote, tcph);
-            }
             State::SynSent => {
                 return self.process_syn_sent(dev, tcph);
             }
@@ -289,7 +304,6 @@ impl Socket {
                             return Err(io::Error::from(io::ErrorKind::ConnectionReset));
                         }
                         self.state = State::Estab;
-                        // println!("accepted a connection from: {}", self.pair.remote);
                         self.tx_buffer.extend(b"Hello WORLD!!!");
                     }
                     false => {
@@ -472,51 +486,6 @@ impl Socket {
                 }
             }
         }
-
-        Ok(())
-    }
-
-    fn process_listen(
-        &mut self,
-        dev: &mut device::TunDevice,
-        remote: SocketAddrV4,
-        hdr: etherparse::TcpHeaderSlice,
-    ) -> io::Result<()> {
-        // RST should be ignored in LISTEN state
-        if hdr.rst() {
-            return Ok(());
-        }
-        if hdr.ack() {
-            return self.write_rst(dev, hdr.acknowledgment_number());
-        }
-
-        if !hdr.syn() {
-            return Ok(());
-        }
-
-        // Security and precedence checks are skipped
-        let mut sock = Socket::new(self.listen_addr);
-        sock.listen();
-        sock.remote_addr = Some(remote);
-        sock.connection_type = ConnectionType::Passive;
-        sock.irs = hdr.sequence_number();
-        sock.rcv_nxt = hdr.sequence_number().wrapping_add(1);
-        sock.rcv_wnd = sock.rx_window();
-        sock.snd_una = sock.iss;
-        sock.snd_nxt = sock.iss.wrapping_add(1);
-        sock.state = State::SynRcvd;
-
-        let flags = TcpFlags {
-            syn: true,
-            ..Default::default()
-        };
-        sock.write_all(dev, sock.iss, Some(sock.rcv_nxt), flags, &[])?;
-
-        // Notify that we got an inbound connection
-        let (lock, cvar) = self.pending.as_ref().unwrap();
-        let mut queue = lock.lock().unwrap();
-        queue.push_back(sock);
-        cvar.notify_one();
 
         Ok(())
     }
