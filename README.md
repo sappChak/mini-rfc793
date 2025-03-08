@@ -1,4 +1,4 @@
-## Gaining hands-on experience with RFC 793 protocol implementation using a TUN device
+## RFC 793 (TCP) protocol implementation using a TUN device
 
 ### Send Sequence Space:
 
@@ -27,7 +27,7 @@
 
                                          Receive Sequence Space
 
-### Notes on RFC793
+### Notes from RFC793
 
 When the TCP transmits a segment containing data, it puts a copy on a retransmission queue and starts a timer; when the acknowledgment for that data is received, the segment is deleted from the queue. If the acknowledgment is not
 received before the timer runs out, the segment is retransmitted.
@@ -82,30 +82,3 @@ in excessive retransmissions, adding unnecessarily to the load on the
 network and the TCPs. Indicating a small window may restrict the
 transmission of data to the point of introducing a round trip delay
 between each new segment transmitted.
-
-psh means that sender is sending all data it has got, i.e a receiver should not wait for
-more data;
-
-## Implementing RTO time-out:
-
-Basically, every RTO timeot is associated with an unacknowledged sequence number. If
-timeout expires and there is no ack received, the segment is retransmitted starting from
-that sequence number.
-
-I don't even fucking know what the fuck I want to achive here. I dont want to write shitty
-ccode but i wind up doing that. it's not good.
-
-BTreeMap + HashMap
-In this TCP impelmentation per-connection retransmission timer is used.
-
-### Timers
-
-Each TCB maintains a sorted map(BTreeMap) of SND_UNA's transmitted but not yet acknowledged. In
-case incoming ACK is grater than a range of SND_UNA's those entries with those seq numbers
-are removed from the map. If keys are seq numbers, values are TimerEntry struct instances,
-which consists of an "expires_at" time, which is calculated with RTO and a callback, which
-has to be invoked in case timer expires. But I can't store cleanly callbacks in a struct which
-derives Hash, as those callbacks can't be compared.
-
-The question is does the tx_buffer queue contain from iss up to snd_una or from snd_una up
-to snd_nxt
