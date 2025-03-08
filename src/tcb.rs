@@ -144,13 +144,16 @@ impl Tcb {
                 "attempt to accept while not in listen state",
             ));
         }
+        if hdr.rst() {
+            return Ok(None);
+        }
         /* security and precedence checks are skipped */
         let mut sock = Tcb::new(cp.local);
+        sock.remote_addr = Some(cp.remote);
         if hdr.ack() {
             sock.write_rst(dev, hdr.acknowledgment_number())?;
         }
         if hdr.syn() {
-            sock.remote_addr = Some(cp.remote);
             sock.connection_type = ConnectionType::Passive;
             sock.irs = hdr.sequence_number();
             sock.rcv_nxt = hdr.sequence_number().wrapping_add(1);
@@ -163,6 +166,7 @@ impl Tcb {
                 syn: true,
                 ..Default::default()
             };
+            println!("sending syn, ack");
             sock.write_all(dev, sock.iss, Some(sock.rcv_nxt), flags, &[])?;
             return Ok(Some(sock));
         }

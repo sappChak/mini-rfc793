@@ -58,7 +58,7 @@ impl TcpListener {
                 ))
             }
             Entry::Vacant(vacant) => {
-                // TODO: move the listen into separate method
+                // TODO: move the listen into a separate method
                 tcb.listen();
                 vacant.insert(tcb);
             }
@@ -154,11 +154,11 @@ pub fn tcp_packet_loop(
                                         pending
                                             .iter_mut()
                                             .find(|tcb| {
-                                                tcph.ack()
-                                                    && tcb.listen_addr() == cp.local
+                                                tcb.listen_addr() == cp.local
                                                     && tcb.remote_addr().unwrap() == cp.remote
                                             })
                                             .map(|client_tcb| {
+                                                // try to complete 3-WH
                                                 client_tcb.on_segment(dev, &tcph, payload)
                                             })
                                             .is_some()
