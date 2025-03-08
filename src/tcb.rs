@@ -2,7 +2,6 @@ use std::{
     collections::{BTreeMap, VecDeque},
     io::{self, Write},
     net::SocketAddrV4,
-    sync::{Condvar, Mutex},
     time::{Duration, Instant},
 };
 
@@ -54,7 +53,7 @@ pub enum ConnectionType {
 }
 
 /// Transmission Control Block
-pub struct Socket {
+pub struct Tcb {
     /// TCB state
     state: State,
     /// Local address specified with listen()
@@ -63,8 +62,6 @@ pub struct Socket {
     remote_addr: Option<SocketAddrV4>,
     /// Determines whether it's a client or a server
     connection_type: ConnectionType,
-    /// Queue of pending connection requests
-    pending: Option<(Mutex<VecDeque<Socket>>, Condvar)>,
     /// Transmit buffer
     pub(crate) tx_buffer: VecDeque<u8>,
     /// Receive buffer
@@ -97,7 +94,7 @@ pub struct Socket {
     timers: BTreeMap<u32, TimerEntry>,
 }
 
-impl Socket {
+impl Tcb {
     pub fn new(addr: SocketAddrV4) -> Self {
         Self {
             state: State::Closed,
@@ -118,37 +115,41 @@ impl Socket {
             rcv_up: 0,
             rto: Duration::from_millis(200),
             timers: BTreeMap::new(),
-            pending: None,
             remote_addr: None,
         }
     }
 
-    pub fn listen(&mut self) {
-        self.state = State::Listen;
-        self.pending = Some((Mutex::new(VecDeque::new()), Condvar::new()));
+    pub fn listen_addr(&self) -> SocketAddrV4 {
+        self.listen_addr
     }
 
-    pub fn remote(&self) -> Option<SocketAddrV4> {
+    pub fn remote_addr(&self) -> Option<SocketAddrV4> {
         self.remote_addr
     }
 
-    pub fn set_remote(&mut self, remote: SocketAddrV4) {
-        self.remote_addr = Some(remote);
+    pub fn listen(&mut self) {
+        self.state = State::Listen;
     }
 
     // half-establish a connection
     pub fn try_accept(
+        &mut self,
         dev: &mut device::TunDevice,
         hdr: &etherparse::TcpHeaderSlice,
         cp: ConnectionPair,
-    ) -> io::Result<Option<Socket>> {
-        // Security and precedence checks are skipped
-        let mut sock = Socket::new(cp.local);
+    ) -> io::Result<Option<Tcb>> {
+        if self.state != State::Listen {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "attempt to accept while not in listen state",
+            ));
+        }
+        /* security and precedence checks are skipped */
+        let mut sock = Tcb::new(cp.local);
         if hdr.ack() {
-            sock.write_rst(dev, hdr.acknowledgment_number());
+            sock.write_rst(dev, hdr.acknowledgment_number())?;
         }
         if hdr.syn() {
-            sock.listen();
             sock.remote_addr = Some(cp.remote);
             sock.connection_type = ConnectionType::Passive;
             sock.irs = hdr.sequence_number();
@@ -163,6 +164,7 @@ impl Socket {
                 ..Default::default()
             };
             sock.write_all(dev, sock.iss, Some(sock.rcv_nxt), flags, &[])?;
+            return Ok(Some(sock));
         }
         Ok(None)
     }
@@ -228,7 +230,7 @@ impl Socket {
     pub(crate) fn on_segment(
         &mut self,
         dev: &mut device::TunDevice,
-        tcph: etherparse::TcpHeaderSlice,
+        tcph: &etherparse::TcpHeaderSlice,
         payload: &[u8],
     ) -> io::Result<()> {
         // Try to establish a connection
@@ -493,7 +495,7 @@ impl Socket {
     fn process_syn_sent(
         &mut self,
         dev: &mut device::TunDevice,
-        hdr: etherparse::TcpHeaderSlice,
+        hdr: &etherparse::TcpHeaderSlice,
     ) -> io::Result<()> {
         let seg_ack = hdr.acknowledgment_number();
         if seg_ack <= self.iss || seg_ack > self.snd_nxt {
@@ -537,7 +539,7 @@ impl Socket {
     fn process_close(
         &mut self,
         dev: &mut device::TunDevice,
-        hdr: etherparse::TcpHeaderSlice,
+        hdr: &etherparse::TcpHeaderSlice,
         payload: &[u8],
     ) -> io::Result<()> {
         if !hdr.rst() {
