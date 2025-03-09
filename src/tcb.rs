@@ -178,7 +178,14 @@ impl Tcb {
     }
 
     pub fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        todo!()
+        if self.rx_buffer.is_empty() {
+            return Ok(0);
+        }
+        let available = self.rx_buffer.len();
+        let to_read = std::cmp::min(buf.len(), available);
+        let drained = self.rx_buffer.drain(..to_read).collect::<Vec<u8>>();
+        buf[..to_read].copy_from_slice(&drained);
+        Ok(to_read)
     }
 
     pub fn on_tick(&mut self, dev: &mut device::TunDevice) -> io::Result<()> {
@@ -310,7 +317,8 @@ impl Tcb {
                             return Err(io::Error::from(io::ErrorKind::ConnectionReset));
                         }
                         self.state = State::Estab;
-                        self.tx_buffer.extend(b"Hello WORLD!!!");
+                        let msg = format!("Hello, {}", self.remote_addr().unwrap());
+                        self.tx_buffer.extend(msg.into_bytes());
                     }
                     false => {
                         self.write_rst(dev, tcph.sequence_number())?;
@@ -410,8 +418,6 @@ impl Tcb {
             // process the segment text
             if !payload.is_empty() {
                 self.rx_buffer.extend(payload);
-
-                println!("Received a message: {}", String::from_utf8_lossy(payload));
 
                 self.rcv_nxt = self.rcv_nxt.wrapping_add(payload.len() as u32);
                 self.rcv_wnd = self.rx_window();

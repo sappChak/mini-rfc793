@@ -11,18 +11,18 @@ pub mod tcb;
 
 pub struct Connections {
     /// Established connections
-    pub estab_table: HashMap<ConnectionPair, Tcb>,
+    pub established: HashMap<ConnectionPair, Tcb>,
     /// Bound TCB's in listen state
-    pub bind_table: HashMap<u16, Tcb>,
-    /// SYN received
+    pub bound: HashMap<u16, Tcb>,
+    /// Queue of half-established connections
     pub pending: VecDeque<Tcb>,
 }
 
 impl Connections {
     pub fn new() -> Self {
         Self {
-            estab_table: HashMap::new(),
-            bind_table: HashMap::new(),
+            established: HashMap::new(),
+            bound: HashMap::new(),
             pending: VecDeque::new(),
         }
     }
@@ -31,6 +31,7 @@ impl Connections {
 pub struct ConnectionManager {
     pub connections: Mutex<Connections>,
     pub pending_cvar: Condvar,
+    pub read_cvar: Condvar,
 }
 
 impl ConnectionManager {
@@ -38,19 +39,20 @@ impl ConnectionManager {
         Self {
             connections: Mutex::new(Connections::new()),
             pending_cvar: Condvar::new(),
+            read_cvar: Condvar::new(),
         }
     }
 }
 
 pub struct TcpListener {
-    inner: Arc<ConnectionManager>,
+    manager: Arc<ConnectionManager>,
 }
 
 impl TcpListener {
-    pub fn bind(addr: SocketAddrV4, mgr: Arc<ConnectionManager>) -> io::Result<TcpListener> {
+    pub fn bind(addr: SocketAddrV4, conn_mgr: Arc<ConnectionManager>) -> io::Result<TcpListener> {
         let mut tcb = Tcb::new(addr);
-        let mut cons_lock = mgr.connections.lock().unwrap();
-        match cons_lock.bind_table.entry(addr.port()) {
+        let mut conns = conn_mgr.connections.lock().unwrap();
+        match conns.bound.entry(addr.port()) {
             Entry::Occupied(_) => {
                 return Err(io::Error::new(
                     io::ErrorKind::AddrInUse,
@@ -63,24 +65,26 @@ impl TcpListener {
                 vacant.insert(tcb);
             }
         }
-        Ok(TcpListener { inner: mgr.clone() })
+        Ok(TcpListener {
+            manager: conn_mgr.clone(),
+        })
     }
 
     pub fn accept(&mut self) -> io::Result<(TcpStream, SocketAddrV4)> {
         loop {
-            let mut mgr = self.inner.connections.lock().unwrap();
-            while mgr.pending.is_empty() {
-                mgr = self.inner.pending_cvar.wait(mgr).unwrap();
+            let mut conns = self.manager.connections.lock().unwrap();
+            while conns.pending.is_empty() {
+                conns = self.manager.pending_cvar.wait(conns).unwrap();
             }
-            while let Some(client_tcb) = mgr.pending.pop_front() {
+            while let Some(estab_tcb) = conns.pending.pop_front() {
                 let cp = ConnectionPair {
-                    local: client_tcb.listen_addr(),
-                    remote: client_tcb.remote_addr().unwrap(),
+                    local: estab_tcb.listen_addr(),
+                    remote: estab_tcb.remote_addr().unwrap(),
                 };
-                mgr.estab_table.insert(cp, client_tcb);
+                conns.established.insert(cp, estab_tcb);
                 return Ok((
                     TcpStream {
-                        inner: self.inner.clone(),
+                        manager: self.manager.clone(),
                         cp,
                     },
                     cp.remote,
@@ -91,7 +95,7 @@ impl TcpListener {
 }
 
 pub struct TcpStream {
-    inner: Arc<ConnectionManager>,
+    manager: Arc<ConnectionManager>,
     cp: ConnectionPair,
 }
 
@@ -101,24 +105,41 @@ impl TcpStream {
     }
 
     pub fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        todo!()
+        let mut conns = self.manager.connections.lock().unwrap();
+        loop {
+            match conns.established.get_mut(&self.cp) {
+                Some(tcb) => {
+                    let n = tcb.read(buf)?;
+                    if n > 0 {
+                        return Ok(n);
+                    }
+                    conns = self.manager.read_cvar.wait(conns).unwrap();
+                }
+                None => return Ok(0),
+            }
+        }
     }
 
     pub fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        todo!()
+        let mut conns = self.manager.connections.lock().unwrap();
+        if let Some(tcb) = conns.established.get_mut(&self.cp) {
+            let n = tcb.write(buf)?;
+            return Ok(n);
+        }
+        Ok(5)
     }
 }
 
-pub fn tcp_packet_loop(
-    dev: &mut device::TunDevice,
-    manager: Arc<ConnectionManager>,
-) -> io::Result<()> {
+pub fn packet_loop(dev: &mut device::TunDevice, manager: Arc<ConnectionManager>) -> io::Result<()> {
     let mut buf = [0u8; 1500]; // MTU
     loop {
         {
-            let mut mgr = manager.connections.lock().unwrap();
-            for tcb in mgr.estab_table.values_mut() {
+            let mut conns = manager.connections.lock().unwrap();
+            for tcb in conns.established.values_mut() {
                 tcb.on_tick(dev)?;
+                if !tcb.rx_buffer.is_empty() {
+                    manager.read_cvar.notify_one();
+                }
             }
         }
         match dev.read(&mut buf) {
@@ -145,12 +166,12 @@ pub fn tcp_packet_loop(
                                 remote: SocketAddrV4::new(src, tcph.source_port()),
                             };
 
-                            let mut connections = manager.connections.lock().unwrap();
-                            match connections.estab_table.entry(cp) {
+                            let mut conns = manager.connections.lock().unwrap();
+                            match conns.established.entry(cp) {
                                 Entry::Vacant(_) => {
                                     // Check the pending queue in its own scope:
                                     let found_in_pending = {
-                                        let pending = &mut connections.pending;
+                                        let pending = &mut conns.pending;
                                         pending
                                             .iter_mut()
                                             .find(|tcb| {
@@ -170,12 +191,12 @@ pub fn tcp_packet_loop(
                                     }
 
                                     if let Some(listening_tcb) =
-                                        connections.bind_table.get_mut(&cp.local.port())
+                                        conns.bound.get_mut(&cp.local.port())
                                     {
                                         if let Some(client_tcb) =
                                             listening_tcb.try_accept(dev, &tcph, cp)?
                                         {
-                                            connections.pending.push_back(client_tcb);
+                                            conns.pending.push_back(client_tcb);
                                         }
                                     }
                                 }
@@ -187,7 +208,7 @@ pub fn tcp_packet_loop(
                                             io::ErrorKind::ConnectionRefused
                                             | io::ErrorKind::ConnectionReset => {
                                                 println!("removing a connection: {:?}", &cp);
-                                                connections.estab_table.remove(&cp);
+                                                conns.established.remove(&cp);
                                             }
                                             _ => {}
                                         }
