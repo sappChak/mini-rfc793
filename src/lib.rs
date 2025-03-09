@@ -32,6 +32,7 @@ pub struct ConnectionManager {
     pub connections: Mutex<Connections>,
     pub pending_cvar: Condvar,
     pub read_cvar: Condvar,
+    pub write_cvar: Condvar,
 }
 
 impl ConnectionManager {
@@ -40,6 +41,7 @@ impl ConnectionManager {
             connections: Mutex::new(Connections::new()),
             pending_cvar: Condvar::new(),
             read_cvar: Condvar::new(),
+            write_cvar: Condvar::new(),
         }
     }
 }
@@ -122,11 +124,18 @@ impl TcpStream {
 
     pub fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let mut conns = self.manager.connections.lock().unwrap();
-        if let Some(tcb) = conns.established.get_mut(&self.cp) {
-            let n = tcb.write(buf)?;
-            return Ok(n);
+        loop {
+            match conns.established.get_mut(&self.cp) {
+                Some(tcb) => {
+                    let n = tcb.write(buf)?;
+                    if n > 0 {
+                        return Ok(n);
+                    }
+                    conns = self.manager.write_cvar.wait(conns).unwrap();
+                }
+                None => return Ok(0),
+            }
         }
-        Ok(5)
     }
 }
 
@@ -138,7 +147,10 @@ pub fn packet_loop(dev: &mut device::TunDevice, manager: Arc<ConnectionManager>)
             for tcb in conns.established.values_mut() {
                 tcb.on_tick(dev)?;
                 if !tcb.rx_buffer.is_empty() {
-                    manager.read_cvar.notify_one();
+                    manager.read_cvar.notify_all();
+                }
+                if !tcb.tx_buffer.is_empty() {
+                    manager.write_cvar.notify_all();
                 }
             }
         }
@@ -186,7 +198,7 @@ pub fn packet_loop(dev: &mut device::TunDevice, manager: Arc<ConnectionManager>)
                                     };
 
                                     if found_in_pending {
-                                        manager.pending_cvar.notify_one();
+                                        manager.pending_cvar.notify_all();
                                         continue;
                                     }
 

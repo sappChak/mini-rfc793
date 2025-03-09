@@ -30,10 +30,10 @@ pub fn main() -> std::io::Result<()> {
                         let received = String::from_utf8_lossy(&buffer[..n]);
                         println!("Received some bytes {:?}", received);
 
-                        // if let Err(e) = stream.write(b"Hello world!") {
-                        //     eprintln!("Failed to send response, {:?}", e);
-                        //     break;
-                        // };
+                        if let Err(e) = stream.write(b"Hello world!") {
+                            eprintln!("Failed to send response, {:?}", e);
+                            break;
+                        };
                     }
                     Err(_) => {
                         break;

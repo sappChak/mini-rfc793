@@ -174,7 +174,8 @@ impl Tcb {
     }
 
     pub fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        todo!()
+        self.tx_buffer.extend(buf);
+        Ok(buf.len())
     }
 
     pub fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
@@ -234,6 +235,8 @@ impl Tcb {
                     payload_len: timer.payload_len,
                 },
             );
+        } else {
+            if !self.tx_buffer.is_empty() {}
         }
         Ok(())
     }
@@ -317,8 +320,6 @@ impl Tcb {
                             return Err(io::Error::from(io::ErrorKind::ConnectionReset));
                         }
                         self.state = State::Estab;
-                        let msg = format!("Hello, {}", self.remote_addr().unwrap());
-                        self.tx_buffer.extend(msg.into_bytes());
                     }
                     false => {
                         self.write_rst(dev, tcph.sequence_number())?;
