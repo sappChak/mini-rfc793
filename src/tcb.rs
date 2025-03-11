@@ -14,10 +14,8 @@ struct TcpFlags {
     rst: bool,
 }
 
-#[derive(Hash, PartialEq, Eq, Debug)]
-struct TimerEntry {
+struct RTOEntry {
     expires_at: Instant,
-    snd_nxt: u32,
     payload_len: usize,
 }
 
@@ -39,6 +37,9 @@ pub enum State {
 
 /// TTL for IPv4
 const HOP_LIMIT: u8 = 64;
+
+/// TUN device MTU
+const TUN_MTU: usize = 1500;
 
 #[derive(Hash, Eq, PartialEq, Debug, Clone, Copy)]
 pub struct ConnectionPair {
@@ -63,7 +64,7 @@ pub struct Tcb {
     /// Determines whether it's a client or a server
     connection_type: ConnectionType,
     /// Transmit buffer
-    pub(crate) tx_buffer: VecDeque<u8>,
+    tx_buffer: VecDeque<u8>,
     /// Receive buffer
     pub(crate) rx_buffer: VecDeque<u8>,
     /// Initial seq number of sender
@@ -91,7 +92,7 @@ pub struct Tcb {
     /// RTO in (ms)
     rto: Duration,
     /// Timeouts for the current connection
-    timers: BTreeMap<u32, TimerEntry>,
+    timers: BTreeMap<u32, RTOEntry>,
 }
 
 impl Tcb {
@@ -132,7 +133,7 @@ impl Tcb {
     }
 
     // half-establish a connection
-    pub fn try_accept(
+    pub fn try_establish(
         &mut self,
         dev: &mut device::TunDevice,
         hdr: &etherparse::TcpHeaderSlice,
@@ -148,27 +149,25 @@ impl Tcb {
             return Ok(None);
         }
         /* security and precedence checks are skipped */
-        let mut sock = Tcb::new(cp.local);
-        sock.remote_addr = Some(cp.remote);
+        let mut tcb = Tcb::new(cp.local);
+        tcb.remote_addr = Some(cp.remote);
         if hdr.ack() {
-            sock.write_rst(dev, hdr.acknowledgment_number())?;
+            tcb.write_rst(dev, hdr.acknowledgment_number())?;
         }
         if hdr.syn() {
-            sock.connection_type = ConnectionType::Passive;
-            sock.irs = hdr.sequence_number();
-            sock.rcv_nxt = hdr.sequence_number().wrapping_add(1);
-            sock.rcv_wnd = sock.rx_window();
-            sock.snd_una = sock.iss;
-            sock.snd_nxt = sock.iss.wrapping_add(1);
-            sock.state = State::SynRcvd;
-
+            tcb.connection_type = ConnectionType::Passive;
+            tcb.irs = hdr.sequence_number();
+            tcb.rcv_nxt = hdr.sequence_number().wrapping_add(1);
+            tcb.rcv_wnd = tcb.rx_window();
+            tcb.snd_una = tcb.iss;
+            tcb.snd_nxt = tcb.iss.wrapping_add(1);
+            tcb.state = State::SynRcvd;
             let flags = TcpFlags {
                 syn: true,
                 ..Default::default()
             };
-            println!("sending syn, ack");
-            sock.write_all(dev, sock.iss, Some(sock.rcv_nxt), flags, &[])?;
-            return Ok(Some(sock));
+            tcb.write_all(dev, tcb.iss, Some(tcb.rcv_nxt), flags, &[])?;
+            return Ok(Some(tcb));
         }
         Ok(None)
     }
@@ -190,53 +189,96 @@ impl Tcb {
     }
 
     pub fn on_tick(&mut self, dev: &mut device::TunDevice) -> io::Result<()> {
+        if !matches!(self.state, State::Estab | State::CloseWait) {
+            return Ok(());
+        }
         let now = Instant::now();
-
-        if let Some((&snd_una, _)) = self
+        if let Some((&seq, _)) = self
             .timers
             .iter()
             .find(|(_, timer)| timer.expires_at <= now)
         {
-            let timer = self.timers.remove(&snd_una).unwrap();
+            let timer = self.timers.remove(&seq).unwrap();
+            let start = seq.wrapping_sub(self.snd_una) as usize;
+            let end = start + timer.payload_len;
 
-            let to_write: Vec<u8> = self
-                .tx_buffer
-                .range(0..timer.payload_len)
-                .copied()
-                .collect();
+            println!("expired: local start_idx: {}, end_idx: {}", start, start);
 
+            let to_write: Vec<u8> = self.tx_buffer.range(start..end).copied().collect();
             println!(
                 "retransmitting: {:?}",
                 String::from_utf8_lossy(to_write.as_slice())
             );
-
             let flags = TcpFlags {
                 psh: true,
                 ..Default::default()
             };
-
-            self.write_all(
-                dev,
-                timer.snd_nxt,
-                Some(self.rcv_nxt),
-                flags,
-                to_write.as_slice(),
-            )?;
-
-            // exponential back-off
+            self.write_all(dev, seq, Some(self.rcv_nxt), flags, to_write.as_slice())?;
             self.rto *= 2;
-
-            // Restart the timer
             self.timers.insert(
-                snd_una,
-                TimerEntry {
+                seq,
+                RTOEntry {
                     expires_at: Instant::now() + self.rto,
-                    snd_nxt: timer.snd_nxt,
                     payload_len: timer.payload_len,
                 },
             );
-        } else {
-            if !self.tx_buffer.is_empty() {}
+        } else if !self.tx_buffer.is_empty() {
+            let available_wnd =
+                self.snd_wnd
+                    .wrapping_sub((self.snd_nxt - self.snd_una) as u16) as usize;
+            // no data can be sent, skip
+            if available_wnd == 0 {
+                return Ok(());
+            }
+            let (head, tail) = self.tx_buffer.as_slices();
+            let to_be_written = std::cmp::min(available_wnd.min(TUN_MTU), self.tx_buffer.len());
+            let mut remaining = to_be_written;
+            let mut window_left = available_wnd;
+            let mut cur_slice = head;
+            let mut cur_pos = 0; // offset within cur_slice
+            let mut seq = self.snd_nxt;
+
+            // send in segments in batches
+            while remaining > 0 && !self.tx_buffer.is_empty() && window_left > 0 {
+                let seg_size: usize =
+                    std::cmp::min(remaining, (cur_slice.len() - cur_pos).min(window_left));
+                // TODO: data may be in flight already, check snd.una
+                let flags = TcpFlags {
+                    psh: true,
+                    ..Default::default()
+                };
+                match self.write_all(
+                    dev,
+                    seq,
+                    Some(self.rcv_nxt),
+                    flags,
+                    &cur_slice[cur_pos..cur_pos + seg_size],
+                ) {
+                    Ok(_) => {
+                        self.timers.insert(
+                            seq,
+                            RTOEntry {
+                                expires_at: Instant::now() + self.rto,
+                                payload_len: seg_size,
+                            },
+                        );
+                        seq = seq.wrapping_add(seg_size as u32);
+                    }
+                    Err(_) => {
+                        break;
+                    }
+                }
+                remaining -= seg_size;
+                window_left -= seg_size;
+                cur_pos += seg_size;
+
+                if cur_pos >= cur_slice.len() {
+                    cur_slice = tail;
+                    cur_pos = 0;
+                }
+            }
+            // When the sender creates a segment and transmits it the sender advances SND.NXT
+            self.snd_nxt = seq;
         }
         Ok(())
     }
@@ -257,14 +299,12 @@ impl Tcb {
             }
             _ => {}
         }
-
         // check sequence number
         if !matches!(self.state, State::Listen | State::SynSent | State::Closed)
-            && !self.is_acceptable(&tcph, payload.len())
+            && !self.is_acceptable(tcph, payload.len())
         {
             self.write_ack(dev)?;
         }
-
         // check the RST bit
         if tcph.rst() {
             match self.state {
@@ -290,29 +330,24 @@ impl Tcb {
                 _ => {}
             }
         }
-
-        // check security and precedence
+        /* security and precedence checks are skipped */
 
         // check the SYN bit
-        if tcph.syn() {
-            if !matches!(self.state, State::Closed | State::SynSent) {
-                // If the SYN is in the window it is an error, send a reset, any
-                // outstanding RECEIVEs and SEND should receive "reset" responses,
-                // all segment queues should be flushed, the user should also
-                // receive an unsolicited general "connection reset" signal, enter
-                // the CLOSED state, delete the TCB, and return.
-                //
-                // If the SYN is not in the window self step would not be reached
-                // and an ack would have been sent in the first step (sequence
-                // number check).
-            }
+        if tcph.syn() && !matches!(self.state, State::Closed | State::SynSent) {
+            // If the SYN is in the window it is an error, send a reset, any
+            // outstanding RECEIVEs and SEND should receive "reset" responses,
+            // all segment queues should be flushed, the user should also
+            // receive an unsolicited general "connection reset" signal, enter
+            // the CLOSED state, delete the TCB, and return.
+            //
+            // If the SYN is not in the window self step would not be reached
+            // and an ack would have been sent in the first step (sequence
+            // number check).
         }
-
         if tcph.ack() {
             let seg_ack = tcph.acknowledgment_number();
             let seg_seq = tcph.sequence_number();
             let seg_wnd = tcph.window_size();
-
             match self.state {
                 State::SynRcvd => match seg_ack > self.snd_una && seg_ack <= self.snd_nxt {
                     true => {
@@ -328,19 +363,17 @@ impl Tcb {
                 State::Estab | State::CloseWait => {
                     if self.snd_una < seg_ack && seg_ack <= self.snd_nxt {
                         println!("received ACK, shifting snd_una...");
-                        self.snd_una = seg_ack;
-
                         // it's possible that not everything was acknowledged
-                        let ack_idx = (seg_ack - self.iss - 1) as usize;
-
+                        let ack_idx = (seg_ack - self.snd_una) as usize;
                         println!(
                             "ack_index: {}, tx_buffer len: {}",
                             ack_idx,
                             self.tx_buffer.len()
                         );
-
                         // remove everything up to seg_ack
-                        self.tx_buffer.drain(0..ack_idx.min(self.tx_buffer.len()));
+                        self.tx_buffer.drain(..ack_idx.min(self.tx_buffer.len()));
+
+                        self.snd_una = seg_ack;
 
                         // cancel the retransmit timer associated with the snd_una
                         if let Some((&key, _)) =
@@ -350,7 +383,6 @@ impl Tcb {
                             self.rto = Duration::from_millis(200);
                             println!("canceled RTO for: {}", key);
                         }
-
                         // updating the window from send sequence space
                         if self.snd_wl1 < seg_seq
                             || (self.snd_wl1 == seg_seq && self.snd_wl2 <= seg_ack)
@@ -360,13 +392,11 @@ impl Tcb {
                             self.snd_wl2 = seg_ack;
                         }
                     }
-
                     if seg_ack > self.snd_una {
                         // If the ACK is duplicate it can be ignored
                         println!("The ACK is duplicate");
                         return Ok(());
                     }
-
                     // If the ACK acks something not yet sent
                     if seg_ack > self.snd_nxt {
                         println!("ACKing something not yet sent");
@@ -410,11 +440,9 @@ impl Tcb {
         } else {
             return Ok(());
         }
-
         if tcph.urg() {
             unimplemented!()
         }
-
         if let State::Estab | State::FinWait1 | State::FinWait2 = self.state {
             // process the segment text
             if !payload.is_empty() {
@@ -424,40 +452,6 @@ impl Tcb {
                 self.rcv_wnd = self.rx_window();
 
                 self.write_ack(dev)?;
-            }
-
-            // transmitting data
-            if !self.tx_buffer.is_empty() {
-                // TODO: fix this embarrassment
-                let (head, _) = self.tx_buffer.as_slices();
-
-                let flags = TcpFlags {
-                    psh: true,
-                    ..Default::default()
-                };
-
-                self.write_all(dev, self.snd_nxt, Some(self.rcv_nxt), flags, head)?;
-
-                println!(
-                    "sending data: {:?}\nsnd_una: {}, snd_nxt: {}",
-                    String::from_utf8_lossy(head),
-                    self.snd_una,
-                    self.snd_nxt
-                );
-
-                // TODO: schedule the RTO, be ready to retransmit everything starting from snd.una
-                self.timers.insert(
-                    self.snd_una,
-                    TimerEntry {
-                        expires_at: Instant::now() + self.rto,
-                        snd_nxt: self.snd_nxt,
-                        payload_len: head.len(),
-                    },
-                );
-
-                // When the sender creates a segment and transmits it the sender advances SND.NXT
-                self.snd_nxt = self.snd_nxt.wrapping_add(head.len() as u32);
-                println!("snd_nxt changed: {}", self.snd_nxt);
             }
         }
 
@@ -499,7 +493,6 @@ impl Tcb {
                 }
             }
         }
-
         Ok(())
     }
 
@@ -515,7 +508,6 @@ impl Tcb {
             }
             return self.write_rst(dev, seg_ack);
         }
-
         match seg_ack >= self.snd_una && seg_ack <= self.snd_nxt {
             true => {
                 if hdr.rst() {
@@ -524,14 +516,12 @@ impl Tcb {
             }
             false => return Ok(()),
         }
-
         if hdr.syn() {
             self.rcv_nxt = hdr.sequence_number() + 1;
             self.irs = hdr.sequence_number();
             if hdr.ack() {
                 self.snd_una = seg_ack;
             }
-
             if self.snd_una > self.iss {
                 self.state = State::Estab;
                 return self.write_all(
@@ -543,7 +533,6 @@ impl Tcb {
                 );
             }
         }
-
         Ok(())
     }
 
@@ -561,20 +550,17 @@ impl Tcb {
                 }
             }
         }
-
         Ok(())
     }
 
     fn segment_length(hdr: &etherparse::TcpHeaderSlice, len: usize) -> u32 {
         let mut seg_len = len as u32;
-
         if hdr.fin() {
             seg_len += 1;
         }
         if hdr.syn() {
             seg_len += 1;
         }
-
         seg_len
     }
 
@@ -673,12 +659,10 @@ impl Tcb {
             seq,
             self.rcv_wnd,
         );
-
         if let Some(ack_num) = ack {
             th.acknowledgment_number = ack_num;
             th.ack = true;
         }
-
         th.syn = flags.syn;
         th.psh = flags.psh;
         th.rst = flags.rst;
@@ -689,9 +673,7 @@ impl Tcb {
             HOP_LIMIT,
         )
         .tcp_header(th);
-
         let mut datagram = Vec::<u8>::with_capacity(builder.size(payload.len()));
-
         match builder.write(&mut datagram, payload) {
             Ok(_) => dev.write_all(datagram.as_slice()),
             Err(_) => Err(std::io::Error::new(

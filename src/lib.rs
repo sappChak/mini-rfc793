@@ -9,6 +9,7 @@ use tcb::{ConnectionPair, Tcb};
 pub mod device;
 pub mod tcb;
 
+#[derive(Default)]
 pub struct Connections {
     /// Established connections
     pub established: HashMap<ConnectionPair, Tcb>,
@@ -28,11 +29,11 @@ impl Connections {
     }
 }
 
+#[derive(Default)]
 pub struct ConnectionManager {
     pub connections: Mutex<Connections>,
     pub pending_cvar: Condvar,
     pub read_cvar: Condvar,
-    pub write_cvar: Condvar,
 }
 
 impl ConnectionManager {
@@ -41,7 +42,6 @@ impl ConnectionManager {
             connections: Mutex::new(Connections::new()),
             pending_cvar: Condvar::new(),
             read_cvar: Condvar::new(),
-            write_cvar: Condvar::new(),
         }
     }
 }
@@ -53,6 +53,7 @@ pub struct TcpListener {
 impl TcpListener {
     pub fn bind(addr: SocketAddrV4, conn_mgr: Arc<ConnectionManager>) -> io::Result<TcpListener> {
         let mut tcb = Tcb::new(addr);
+        tcb.listen();
         let mut conns = conn_mgr.connections.lock().unwrap();
         match conns.bound.entry(addr.port()) {
             Entry::Occupied(_) => {
@@ -62,8 +63,6 @@ impl TcpListener {
                 ))
             }
             Entry::Vacant(vacant) => {
-                // TODO: move the listen into a separate method
-                tcb.listen();
                 vacant.insert(tcb);
             }
         }
@@ -78,12 +77,12 @@ impl TcpListener {
             while conns.pending.is_empty() {
                 conns = self.manager.pending_cvar.wait(conns).unwrap();
             }
-            while let Some(estab_tcb) = conns.pending.pop_front() {
+            if let Some(tcb) = conns.pending.pop_front() {
                 let cp = ConnectionPair {
-                    local: estab_tcb.listen_addr(),
-                    remote: estab_tcb.remote_addr().unwrap(),
+                    local: tcb.listen_addr(),
+                    remote: tcb.remote_addr().unwrap(),
                 };
-                conns.established.insert(cp, estab_tcb);
+                conns.established.insert(cp, tcb);
                 return Ok((
                     TcpStream {
                         manager: self.manager.clone(),
@@ -131,7 +130,7 @@ impl TcpStream {
                     if n > 0 {
                         return Ok(n);
                     }
-                    conns = self.manager.write_cvar.wait(conns).unwrap();
+                    // TODO:
                 }
                 None => return Ok(0),
             }
@@ -142,30 +141,24 @@ impl TcpStream {
 pub fn packet_loop(dev: &mut device::TunDevice, manager: Arc<ConnectionManager>) -> io::Result<()> {
     let mut buf = [0u8; 1500]; // MTU
     loop {
-        {
-            let mut conns = manager.connections.lock().unwrap();
-            for tcb in conns.established.values_mut() {
-                tcb.on_tick(dev)?;
-                if !tcb.rx_buffer.is_empty() {
-                    manager.read_cvar.notify_all();
-                }
-                if !tcb.tx_buffer.is_empty() {
-                    manager.write_cvar.notify_all();
-                }
+        let mut conns = manager.connections.lock().unwrap();
+        for tcb in conns.established.values_mut() {
+            tcb.on_tick(dev)?;
+            if !tcb.rx_buffer.is_empty() {
+                manager.read_cvar.notify_all();
             }
         }
+        drop(conns);
         match dev.read(&mut buf) {
             Ok(n) => {
                 let pkt = &buf[0..n];
                 if let Ok(iph) = etherparse::Ipv4HeaderSlice::from_slice(pkt) {
                     let src = iph.source_addr();
                     let dest = iph.destination_addr();
-
                     // Reject everything not TCP for now
                     if iph.protocol() != etherparse::IpNumber::TCP {
                         continue;
                     }
-
                     let tcp_offset: usize = (iph.ihl() << 2).into(); // IP header is 4 words long
                     match etherparse::TcpHeaderSlice::from_slice(&pkt[tcp_offset..]) {
                         Ok(tcph) => {
@@ -177,11 +170,10 @@ pub fn packet_loop(dev: &mut device::TunDevice, manager: Arc<ConnectionManager>)
                                 local: SocketAddrV4::new(dest, tcph.destination_port()),
                                 remote: SocketAddrV4::new(src, tcph.source_port()),
                             };
-
                             let mut conns = manager.connections.lock().unwrap();
                             match conns.established.entry(cp) {
                                 Entry::Vacant(_) => {
-                                    // Check the pending queue in its own scope:
+                                    // it's likely, the connection was already initialized:
                                     let found_in_pending = {
                                         let pending = &mut conns.pending;
                                         pending
@@ -196,17 +188,18 @@ pub fn packet_loop(dev: &mut device::TunDevice, manager: Arc<ConnectionManager>)
                                             })
                                             .is_some()
                                     };
-
                                     if found_in_pending {
+                                        // notify accept() about established connection
                                         manager.pending_cvar.notify_all();
                                         continue;
                                     }
 
+                                    // connection wasn't initialized
                                     if let Some(listening_tcb) =
                                         conns.bound.get_mut(&cp.local.port())
                                     {
                                         if let Some(client_tcb) =
-                                            listening_tcb.try_accept(dev, &tcph, cp)?
+                                            listening_tcb.try_establish(dev, &tcph, cp)?
                                         {
                                             conns.pending.push_back(client_tcb);
                                         }
@@ -221,6 +214,7 @@ pub fn packet_loop(dev: &mut device::TunDevice, manager: Arc<ConnectionManager>)
                                             | io::ErrorKind::ConnectionReset => {
                                                 println!("removing a connection: {:?}", &cp);
                                                 conns.established.remove(&cp);
+                                                manager.read_cvar.notify_all();
                                             }
                                             _ => {}
                                         }
