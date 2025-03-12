@@ -141,10 +141,9 @@ impl TcpStream {
     }
 
     pub fn shutdown(&mut self) {
-        // TODO:
         let mut conns = self.manager.connections.lock().unwrap();
         if let Some(tcb) = conns.established.get_mut(&self.cp) {
-            tcb.close().unwrap()
+            tcb.close()
         }
     }
 }
@@ -168,7 +167,10 @@ pub fn packet_loop(dev: &mut device::TunDevice, manager: Arc<ConnectionManager>)
         for tcb in conns.established.values_mut() {
             tcb.on_tick(dev)?;
         }
+        // not so effective, deal with it later
+        conns.established.retain(|_, tcb| !tcb.is_closed());
         drop(conns);
+
         match dev.read(&mut buf) {
             Ok(n) => {
                 let pkt = &buf[0..n];
@@ -185,7 +187,7 @@ pub fn packet_loop(dev: &mut device::TunDevice, manager: Arc<ConnectionManager>)
                             let data_offset: usize = (tcph.data_offset() << 2).into();
                             let payload = &pkt[tcp_offset + data_offset..];
 
-                            /* Uniquely represents a connection */
+                            /* uniquely represents a connection */
                             let cp = ConnectionPair {
                                 local: SocketAddrV4::new(dest, tcph.destination_port()),
                                 remote: SocketAddrV4::new(src, tcph.source_port()),

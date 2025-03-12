@@ -17,6 +17,7 @@ const TUN_MTU: usize = 1500;
 #[derive(Default)]
 struct TcpFlags {
     syn: bool,
+    fin: bool,
     psh: bool,
     rst: bool,
 }
@@ -133,12 +134,23 @@ impl Tcb {
         self.state = State::Listen;
     }
 
+    pub fn pair(&self) -> ConnectionPair {
+        ConnectionPair {
+            local: self.listen_addr(),
+            remote: self.remote_addr().unwrap(),
+        }
+    }
+
     pub fn has_data(&mut self) -> bool {
         !self.rx_buffer.is_empty()
     }
 
-    pub fn is_closing(&mut self) -> bool {
+    pub fn is_closing(&self) -> bool {
         matches!(self.state, State::CloseWait | State::Closed)
+    }
+
+    pub fn is_closed(&self) -> bool {
+        matches!(self.state, State::Closed)
     }
 
     // half-establish a connection
@@ -194,12 +206,15 @@ impl Tcb {
         Ok(to_read)
     }
 
-    pub fn close(&mut self) -> io::Result<()> {
-        Ok(())
+    pub fn close(&mut self) {
+        if self.state != State::CloseWait {
+            return;
+        }
+        self.state = State::LastAck;
     }
 
     pub fn on_tick(&mut self, dev: &mut device::TunDevice) -> io::Result<()> {
-        if !matches!(self.state, State::Estab | State::CloseWait) {
+        if !matches!(self.state, State::Estab | State::CloseWait | State::LastAck) {
             return Ok(());
         }
         let now = Instant::now();
@@ -214,16 +229,22 @@ impl Tcb {
 
             println!("expired: local start_idx: {}, end_idx: {}", start, start);
 
-            let to_write: Vec<u8> = self.tx_buffer.range(start..end).copied().collect();
+            let to_be_written: Vec<u8> = self.tx_buffer.range(start..end).copied().collect();
             println!(
                 "retransmitting: {:?}",
-                String::from_utf8_lossy(to_write.as_slice())
+                String::from_utf8_lossy(to_be_written.as_slice())
             );
             let flags = TcpFlags {
                 psh: true,
                 ..Default::default()
             };
-            self.write_all(dev, seq, Some(self.rcv_nxt), flags, to_write.as_slice())?;
+            self.write_all(
+                dev,
+                seq,
+                Some(self.rcv_nxt),
+                flags,
+                to_be_written.as_slice(),
+            )?;
             self.rto *= 2;
             self.timers.insert(
                 seq,
@@ -248,7 +269,7 @@ impl Tcb {
             let mut cur_pos = 0; // offset within cur_slice
             let mut seq = self.snd_nxt;
 
-            // send in segments in batches
+            /* send segments in batches */
             while remaining > 0 && !self.tx_buffer.is_empty() && window_left > 0 {
                 let seg_size: usize =
                     std::cmp::min(remaining, (cur_slice.len() - cur_pos).min(window_left));
@@ -287,9 +308,21 @@ impl Tcb {
                     cur_pos = 0;
                 }
             }
-            // When the sender creates a segment and transmits it the sender advances SND.NXT
+            // when the sender creates a segment and transmits it the sender advances SND.NXT
             self.snd_nxt = seq;
         }
+
+        if self.state == State::LastAck {
+            // <SEQ=seq><ACK=rcv_nxt><CTL=FIN,ACK>
+            let seq = self.snd_nxt;
+            let flags = TcpFlags {
+                fin: true,
+                ..Default::default()
+            };
+            self.write_all(dev, seq, Some(self.rcv_nxt), flags, &[])?;
+            self.snd_nxt += self.snd_nxt.wrapping_add(1);
+        }
+
         Ok(())
     }
 
@@ -300,7 +333,7 @@ impl Tcb {
         payload: &[u8],
         read_cvar: &Condvar,
     ) -> io::Result<()> {
-        // Try to establish a connection
+        // try to establish a connection
         match self.state {
             State::SynSent => {
                 return self.process_syn_sent(dev, tcph);
@@ -433,6 +466,7 @@ impl Tcb {
                     // The only thing that can arrive in self state is an
                     // acknowledgment of our FIN.  If our FIN is now acknowledged,
                     // delete the TCB, enter the CLOSED state, and return.
+                    self.state = State::Closed;
                 }
                 State::TimeWait => {
                     // TODO:
@@ -461,37 +495,37 @@ impl Tcb {
 
         // SEG.SEQ cannot be validated in CLOSED, LISTEN or SYN-SENT, drop and return
         if tcph.fin() && !matches!(self.state, State::Closed | State::Listen | State::SynSent) {
-            if !matches!(self.state, State::Closed | State::Listen | State::SynSent) {
-                self.rcv_nxt = self.rcv_nxt.wrapping_add(1); // FIN bit takes 1 seq number
-                self.write_ack(dev)?;
-                println!("connection closing");
-                read_cvar.notify_all();
-                // send any remaining data?
-                match self.state {
-                    State::SynRcvd | State::Estab => {
-                        self.state = State::CloseWait;
-                        // TODO: send FIN + start
-                    }
-                    State::FinWait1 => {
-                        // TODO:
-                        // If our FIN has been ACKed (perhaps in this segment), then
-                        // enter TIME-WAIT, start the time-wait timer, turn off the other
-                        // timers; otherwise enter the CLOSING state.
-                    }
-                    State::FinWait2 => {
-                        // TODO:
-                        // Enter the TIME-WAIT state.  Start the time-wait timer, turn
-                        // off the other timers.
-                    }
-                    State::TimeWait => {
-                        // TODO:
-                        // Remain in the TIME-WAIT state.  Restart the 2 MSL time-wait
-                        // timeout and return.
-                    }
+            self.rcv_nxt = self.rcv_nxt.wrapping_add(1); // FIN bit takes 1 seq number
+            self.write_ack(dev)?;
 
-                    // Remain in other states
-                    _ => {}
+            println!("connection closing");
+            read_cvar.notify_all();
+
+            // send any remaining data?
+            match self.state {
+                State::SynRcvd | State::Estab => {
+                    self.state = State::CloseWait;
+                    // TODO: send FIN + start
                 }
+                State::FinWait1 => {
+                    // TODO:
+                    // If our FIN has been ACKed (perhaps in this segment), then
+                    // enter TIME-WAIT, start the time-wait timer, turn off the other
+                    // timers; otherwise enter the CLOSING state.
+                }
+                State::FinWait2 => {
+                    // TODO:
+                    // Enter the TIME-WAIT state.  Start the time-wait timer, turn
+                    // off the other timers.
+                }
+                State::TimeWait => {
+                    // TODO:
+                    // Remain in the TIME-WAIT state.  Restart the 2 MSL time-wait
+                    // timeout and return.
+                }
+
+                // Remain in other states
+                _ => {}
             }
         }
         Ok(())
@@ -509,6 +543,7 @@ impl Tcb {
             }
             return self.write_rst(dev, seg_ack);
         }
+
         match seg_ack >= self.snd_una && seg_ack <= self.snd_nxt {
             true => {
                 if hdr.rst() {
@@ -517,6 +552,7 @@ impl Tcb {
             }
             false => return Ok(()),
         }
+
         if hdr.syn() {
             self.rcv_nxt = hdr.sequence_number() + 1;
             self.irs = hdr.sequence_number();
@@ -665,6 +701,7 @@ impl Tcb {
             th.ack = true;
         }
         th.syn = flags.syn;
+        th.fin = flags.fin;
         th.psh = flags.psh;
         th.rst = flags.rst;
 
