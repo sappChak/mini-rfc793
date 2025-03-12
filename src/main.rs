@@ -7,13 +7,12 @@ fn handle_stream(mut stream: TcpStream) -> std::io::Result<()> {
     loop {
         match stream.read(&mut buffer) {
             Ok(0) => {
-                println!("Client disconnected");
+                println!("Client disconnected!");
                 break;
             }
             Ok(n) => {
                 let received = String::from_utf8_lossy(&buffer[..n]);
                 println!("Received some bytes {:?}", received);
-
                 if let Err(e) = stream.write(b"omg, don't touch it, it's working!") {
                     eprintln!("Failed to send response, {:?}", e);
                     break;

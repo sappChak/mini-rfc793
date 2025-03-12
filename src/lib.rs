@@ -13,7 +13,7 @@ pub mod tcb;
 pub struct Connections {
     /// Established connections
     pub established: HashMap<ConnectionPair, Tcb>,
-    /// Bound TCB's in listen state
+    /// Bound TCB's in LISTEN state
     pub bound: HashMap<u16, Tcb>,
     /// Queue of half-established connections
     pub pending: VecDeque<Tcb>,
@@ -82,6 +82,7 @@ impl TcpListener {
                     local: tcb.listen_addr(),
                     remote: tcb.remote_addr().unwrap(),
                 };
+                println!("new tcb is inserted");
                 conns.established.insert(cp, tcb);
                 return Ok((
                     TcpStream {
@@ -110,13 +111,15 @@ impl TcpStream {
         loop {
             match conns.established.get_mut(&self.cp) {
                 Some(tcb) => {
-                    let n = tcb.read(buf)?;
-                    if n > 0 {
-                        return Ok(n);
+                    if tcb.has_data() {
+                        return tcb.read(buf);
                     }
-                    conns = self.manager.read_cvar.wait(conns).unwrap();
+                    if tcb.is_closing() {
+                        return Ok(0);
+                    }
+                    conns = self.manager.read_cvar.wait(conns).unwrap(); // releases the lock
                 }
-                None => return Ok(0),
+                None => return Ok(0), // it's some kind of an error, deal with it later
             }
         }
     }
@@ -136,6 +139,26 @@ impl TcpStream {
             }
         }
     }
+
+    pub fn shutdown(&mut self) {
+        // TODO:
+        let mut conns = self.manager.connections.lock().unwrap();
+        if let Some(tcb) = conns.established.get_mut(&self.cp) {
+            tcb.close().unwrap()
+        }
+    }
+}
+
+impl Drop for TcpStream {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+impl Drop for TcpListener {
+    fn drop(&mut self) {
+        println!("bye, bye my dear listener");
+    }
 }
 
 pub fn packet_loop(dev: &mut device::TunDevice, manager: Arc<ConnectionManager>) -> io::Result<()> {
@@ -144,9 +167,6 @@ pub fn packet_loop(dev: &mut device::TunDevice, manager: Arc<ConnectionManager>)
         let mut conns = manager.connections.lock().unwrap();
         for tcb in conns.established.values_mut() {
             tcb.on_tick(dev)?;
-            if !tcb.rx_buffer.is_empty() {
-                manager.read_cvar.notify_all();
-            }
         }
         drop(conns);
         match dev.read(&mut buf) {
@@ -184,12 +204,17 @@ pub fn packet_loop(dev: &mut device::TunDevice, manager: Arc<ConnectionManager>)
                                             })
                                             .map(|client_tcb| {
                                                 // try to complete 3-WH
-                                                client_tcb.on_segment(dev, &tcph, payload)
+                                                client_tcb.on_segment(
+                                                    dev,
+                                                    &tcph,
+                                                    payload,
+                                                    &manager.read_cvar,
+                                                )
                                             })
                                             .is_some()
                                     };
                                     if found_in_pending {
-                                        // notify accept() about established connection
+                                        // notify accept() about an established connection
                                         manager.pending_cvar.notify_all();
                                         continue;
                                     }
@@ -206,9 +231,12 @@ pub fn packet_loop(dev: &mut device::TunDevice, manager: Arc<ConnectionManager>)
                                     }
                                 }
                                 Entry::Occupied(mut occupied) => {
-                                    if let Err(error) =
-                                        occupied.get_mut().on_segment(dev, &tcph, payload)
-                                    {
+                                    if let Err(error) = occupied.get_mut().on_segment(
+                                        dev,
+                                        &tcph,
+                                        payload,
+                                        &manager.read_cvar,
+                                    ) {
                                         match error.kind() {
                                             io::ErrorKind::ConnectionRefused
                                             | io::ErrorKind::ConnectionReset => {

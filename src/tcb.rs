@@ -2,10 +2,17 @@ use std::{
     collections::{BTreeMap, VecDeque},
     io::{self, Write},
     net::SocketAddrV4,
+    sync::Condvar,
     time::{Duration, Instant},
 };
 
 use crate::device;
+
+/// TTL for IPv4
+const HOP_LIMIT: u8 = 64;
+
+/// TUN device MTU
+const TUN_MTU: usize = 1500;
 
 #[derive(Default)]
 struct TcpFlags {
@@ -35,12 +42,6 @@ pub enum State {
     Closed,
 }
 
-/// TTL for IPv4
-const HOP_LIMIT: u8 = 64;
-
-/// TUN device MTU
-const TUN_MTU: usize = 1500;
-
 #[derive(Hash, Eq, PartialEq, Debug, Clone, Copy)]
 pub struct ConnectionPair {
     pub local: SocketAddrV4,
@@ -66,7 +67,7 @@ pub struct Tcb {
     /// Transmit buffer
     tx_buffer: VecDeque<u8>,
     /// Receive buffer
-    pub(crate) rx_buffer: VecDeque<u8>,
+    rx_buffer: VecDeque<u8>,
     /// Initial seq number of sender
     iss: u32,
     /// Last unacknowledged byte sent
@@ -132,6 +133,14 @@ impl Tcb {
         self.state = State::Listen;
     }
 
+    pub fn has_data(&mut self) -> bool {
+        !self.rx_buffer.is_empty()
+    }
+
+    pub fn is_closing(&mut self) -> bool {
+        matches!(self.state, State::CloseWait | State::Closed)
+    }
+
     // half-establish a connection
     pub fn try_establish(
         &mut self,
@@ -178,14 +187,15 @@ impl Tcb {
     }
 
     pub fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if self.rx_buffer.is_empty() {
-            return Ok(0);
-        }
         let available = self.rx_buffer.len();
         let to_read = std::cmp::min(buf.len(), available);
         let drained = self.rx_buffer.drain(..to_read).collect::<Vec<u8>>();
         buf[..to_read].copy_from_slice(&drained);
         Ok(to_read)
+    }
+
+    pub fn close(&mut self) -> io::Result<()> {
+        Ok(())
     }
 
     pub fn on_tick(&mut self, dev: &mut device::TunDevice) -> io::Result<()> {
@@ -288,6 +298,7 @@ impl Tcb {
         dev: &mut device::TunDevice,
         tcph: &etherparse::TcpHeaderSlice,
         payload: &[u8],
+        read_cvar: &Condvar,
     ) -> io::Result<()> {
         // Try to establish a connection
         match self.state {
@@ -362,8 +373,6 @@ impl Tcb {
                 },
                 State::Estab | State::CloseWait => {
                     if self.snd_una < seg_ack && seg_ack <= self.snd_nxt {
-                        println!("received ACK, shifting snd_una...");
-                        // it's possible that not everything was acknowledged
                         let ack_idx = (seg_ack - self.snd_una) as usize;
                         println!(
                             "ack_index: {}, tx_buffer len: {}",
@@ -372,12 +381,9 @@ impl Tcb {
                         );
                         // remove everything up to seg_ack
                         self.tx_buffer.drain(..ack_idx.min(self.tx_buffer.len()));
-
                         self.snd_una = seg_ack;
-
                         // cancel the retransmit timer associated with the snd_una
-                        if let Some((&key, _)) =
-                            self.timers.iter().find(|(&snd_una, _)| snd_una <= seg_ack)
+                        if let Some((&key, _)) = self.timers.iter().find(|(&seq, _)| seq <= seg_ack)
                         {
                             self.timers.remove(&key).unwrap();
                             self.rto = Duration::from_millis(200);
@@ -404,7 +410,6 @@ impl Tcb {
                     }
                 }
                 State::FinWait1 => {
-                    // TODO:
                     // In addition to the processing for the ESTABLISHED state, if
                     // our FIN is now acknowledged then enter FIN-WAIT-2 and continue
                     // processing in that state.
@@ -447,29 +452,25 @@ impl Tcb {
             // process the segment text
             if !payload.is_empty() {
                 self.rx_buffer.extend(payload);
-
                 self.rcv_nxt = self.rcv_nxt.wrapping_add(payload.len() as u32);
                 self.rcv_wnd = self.rx_window();
-
                 self.write_ack(dev)?;
+                read_cvar.notify_all();
             }
         }
 
-        // TODO: eighth, check the FIN bit
-        if tcph.fin() {
-            // SEG.SEQ cannot be validated in CLOSED, LISTEN or SYN-SENT
+        // SEG.SEQ cannot be validated in CLOSED, LISTEN or SYN-SENT, drop and return
+        if tcph.fin() && !matches!(self.state, State::Closed | State::Listen | State::SynSent) {
             if !matches!(self.state, State::Closed | State::Listen | State::SynSent) {
-                println!("Connection closing");
-
-                self.state = State::CloseWait;
-
-                self.rcv_nxt = self.rcv_nxt.wrapping_add(1);
-
+                self.rcv_nxt = self.rcv_nxt.wrapping_add(1); // FIN bit takes 1 seq number
                 self.write_ack(dev)?;
-
+                println!("connection closing");
+                read_cvar.notify_all();
+                // send any remaining data?
                 match self.state {
                     State::SynRcvd | State::Estab => {
                         self.state = State::CloseWait;
+                        // TODO: send FIN + start
                     }
                     State::FinWait1 => {
                         // TODO:
@@ -479,7 +480,7 @@ impl Tcb {
                     }
                     State::FinWait2 => {
                         // TODO:
-                        //Enter the TIME-WAIT state.  Start the time-wait timer, turn
+                        // Enter the TIME-WAIT state.  Start the time-wait timer, turn
                         // off the other timers.
                     }
                     State::TimeWait => {
