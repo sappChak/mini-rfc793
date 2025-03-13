@@ -126,17 +126,9 @@ impl TcpStream {
 
     pub fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let mut conns = self.manager.connections.lock().unwrap();
-        loop {
-            match conns.established.get_mut(&self.cp) {
-                Some(tcb) => {
-                    let n = tcb.write(buf)?;
-                    if n > 0 {
-                        return Ok(n);
-                    }
-                    // TODO:
-                }
-                None => return Ok(0),
-            }
+        match conns.established.get_mut(&self.cp) {
+            Some(tcb) => return tcb.write(buf),
+            None => return Ok(0),
         }
     }
 
@@ -156,7 +148,7 @@ impl Drop for TcpStream {
 
 impl Drop for TcpListener {
     fn drop(&mut self) {
-        println!("bye, bye my dear listener");
+        println!("bye-bye, my dear listener");
     }
 }
 
@@ -167,7 +159,7 @@ pub fn packet_loop(dev: &mut device::TunDevice, manager: Arc<ConnectionManager>)
         for tcb in conns.established.values_mut() {
             tcb.on_tick(dev)?;
         }
-        // not so effective, deal with it later
+        // pretty slow, deal with it later
         conns.established.retain(|_, tcb| !tcb.is_closed());
         drop(conns);
 
@@ -200,10 +192,7 @@ pub fn packet_loop(dev: &mut device::TunDevice, manager: Arc<ConnectionManager>)
                                         let pending = &mut conns.pending;
                                         pending
                                             .iter_mut()
-                                            .find(|tcb| {
-                                                tcb.listen_addr() == cp.local
-                                                    && tcb.remote_addr().unwrap() == cp.remote
-                                            })
+                                            .find(|tcb| tcb.pair().unwrap() == cp)
                                             .map(|client_tcb| {
                                                 // try to complete 3-WH
                                                 client_tcb.on_segment(
@@ -221,7 +210,7 @@ pub fn packet_loop(dev: &mut device::TunDevice, manager: Arc<ConnectionManager>)
                                         continue;
                                     }
 
-                                    // connection wasn't initialized
+                                    // connection wasn't initialized, try to establish one
                                     if let Some(listening_tcb) =
                                         conns.bound.get_mut(&cp.local.port())
                                     {
