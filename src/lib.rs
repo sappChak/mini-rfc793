@@ -1,22 +1,28 @@
+pub mod device;
+
+pub mod ip;
+
+pub mod tcb;
+use tcb::{ConnectionPair, Tcb};
+
 use std::{
     collections::{hash_map::Entry, HashMap, VecDeque},
-    io::{self, Read},
+    io::{self},
     net::SocketAddrV4,
     sync::{Arc, Condvar, Mutex},
 };
 
-use tcb::{ConnectionPair, Tcb};
-pub mod device;
-pub mod tcb;
+/// TUN device MTU
+const TUN_MTU: usize = 1500;
 
 #[derive(Default)]
 pub struct Connections {
     /// Established connections
-    pub established: HashMap<ConnectionPair, Tcb>,
+    established: HashMap<ConnectionPair, Tcb>,
     /// Bound TCB's in LISTEN state
-    pub bound: HashMap<u16, Tcb>,
+    bound: HashMap<u16, Tcb>,
     /// Queue of half-established connections
-    pub pending: VecDeque<Tcb>,
+    pending: VecDeque<Tcb>,
 }
 
 impl Connections {
@@ -26,6 +32,12 @@ impl Connections {
             bound: HashMap::new(),
             pending: VecDeque::new(),
         }
+    }
+
+    fn find_in_pending(&mut self, cp: ConnectionPair) -> Option<&mut Tcb> {
+        self.pending
+            .iter_mut()
+            .find(|tcb| tcb.pair().unwrap() == cp)
     }
 }
 
@@ -82,7 +94,6 @@ impl TcpListener {
                     local: tcb.listen_addr(),
                     remote: tcb.remote_addr().unwrap(),
                 };
-                println!("new tcb is inserted");
                 conns.established.insert(cp, tcb);
                 return Ok((
                     TcpStream {
@@ -111,15 +122,15 @@ impl TcpStream {
         loop {
             match conns.established.get_mut(&self.cp) {
                 Some(tcb) => {
-                    if tcb.has_data() {
+                    if !tcb.rx_is_empty() {
                         return tcb.read(buf);
                     }
                     if tcb.is_closing() {
                         return Ok(0);
                     }
-                    conns = self.manager.read_cvar.wait(conns).unwrap(); // releases the lock
+                    conns = self.manager.read_cvar.wait(conns).unwrap();
                 }
-                None => return Ok(0), // it's some kind of an error, deal with it later
+                None => return Ok(0),
             }
         }
     }
@@ -127,15 +138,15 @@ impl TcpStream {
     pub fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let mut conns = self.manager.connections.lock().unwrap();
         match conns.established.get_mut(&self.cp) {
-            Some(tcb) => return tcb.write(buf),
-            None => return Ok(0),
+            Some(tcb) => tcb.write(buf),
+            None => Ok(0),
         }
     }
 
     pub fn shutdown(&mut self) {
         let mut conns = self.manager.connections.lock().unwrap();
         if let Some(tcb) = conns.established.get_mut(&self.cp) {
-            tcb.close()
+            tcb.init_closing()
         }
     }
 }
@@ -143,110 +154,5 @@ impl TcpStream {
 impl Drop for TcpStream {
     fn drop(&mut self) {
         self.shutdown();
-    }
-}
-
-impl Drop for TcpListener {
-    fn drop(&mut self) {
-        println!("bye-bye, my dear listener");
-    }
-}
-
-pub fn packet_loop(dev: &mut device::TunDevice, manager: Arc<ConnectionManager>) -> io::Result<()> {
-    let mut buf = [0u8; 1500]; // MTU
-    loop {
-        let mut conns = manager.connections.lock().unwrap();
-        for tcb in conns.established.values_mut() {
-            tcb.on_tick(dev)?;
-        }
-        // pretty slow, deal with it later
-        conns.established.retain(|_, tcb| !tcb.is_closed());
-        drop(conns);
-
-        match dev.read(&mut buf) {
-            Ok(n) => {
-                let pkt = &buf[0..n];
-                if let Ok(iph) = etherparse::Ipv4HeaderSlice::from_slice(pkt) {
-                    let src = iph.source_addr();
-                    let dest = iph.destination_addr();
-                    // Reject everything not TCP for now
-                    if iph.protocol() != etherparse::IpNumber::TCP {
-                        continue;
-                    }
-                    let tcp_offset: usize = (iph.ihl() << 2).into(); // IP header is 4 words long
-                    match etherparse::TcpHeaderSlice::from_slice(&pkt[tcp_offset..]) {
-                        Ok(tcph) => {
-                            let data_offset: usize = (tcph.data_offset() << 2).into();
-                            let payload = &pkt[tcp_offset + data_offset..];
-
-                            /* uniquely represents a connection */
-                            let cp = ConnectionPair {
-                                local: SocketAddrV4::new(dest, tcph.destination_port()),
-                                remote: SocketAddrV4::new(src, tcph.source_port()),
-                            };
-                            let mut conns = manager.connections.lock().unwrap();
-                            match conns.established.entry(cp) {
-                                Entry::Vacant(_) => {
-                                    // it's likely, the connection was already initialized:
-                                    let found_in_pending = {
-                                        let pending = &mut conns.pending;
-                                        pending
-                                            .iter_mut()
-                                            .find(|tcb| tcb.pair().unwrap() == cp)
-                                            .map(|client_tcb| {
-                                                // try to complete 3-WH
-                                                client_tcb.on_segment(
-                                                    dev,
-                                                    &tcph,
-                                                    payload,
-                                                    &manager.read_cvar,
-                                                )
-                                            })
-                                            .is_some()
-                                    };
-                                    if found_in_pending {
-                                        // notify accept() about an established connection
-                                        manager.pending_cvar.notify_all();
-                                        continue;
-                                    }
-
-                                    // connection wasn't initialized, try to establish one
-                                    if let Some(listening_tcb) =
-                                        conns.bound.get_mut(&cp.local.port())
-                                    {
-                                        if let Some(client_tcb) =
-                                            listening_tcb.try_establish(dev, &tcph, cp)?
-                                        {
-                                            conns.pending.push_back(client_tcb);
-                                        }
-                                    }
-                                }
-                                Entry::Occupied(mut occupied) => {
-                                    if let Err(error) = occupied.get_mut().on_segment(
-                                        dev,
-                                        &tcph,
-                                        payload,
-                                        &manager.read_cvar,
-                                    ) {
-                                        match error.kind() {
-                                            io::ErrorKind::ConnectionRefused
-                                            | io::ErrorKind::ConnectionReset => {
-                                                println!("removing a connection: {:?}", &cp);
-                                                conns.established.remove(&cp);
-                                                manager.read_cvar.notify_all();
-                                            }
-                                            _ => {}
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => println!("error parsing TCP segment {:?}", e),
-                    }
-                }
-            }
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
-            Err(e) => return Err(e),
-        }
     }
 }
