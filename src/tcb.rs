@@ -6,13 +6,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::device;
+use crate::{device, TUN_MTU};
 
 /// TTL for IPv4
 const HOP_LIMIT: u8 = 64;
 
-/// TUN device MTU
-const TUN_MTU: usize = 1500;
+/// Limit for send's
+const QUEUE_LIMIT: usize = 1024;
 
 #[derive(Default)]
 struct TcpFlags {
@@ -26,6 +26,42 @@ struct RTOEntry {
     expires_at: Instant,
     flags: TcpFlags,
     payload_len: usize,
+}
+
+struct TimerManager {
+    rtos: BTreeMap<u32, RTOEntry>,
+}
+
+impl TimerManager {
+    pub fn new() -> Self {
+        Self {
+            rtos: BTreeMap::new(),
+        }
+    }
+
+    fn start_rto(&mut self, seq: u32, flags: TcpFlags, rto: Duration, payload_len: usize) {
+        self.rtos.insert(
+            seq,
+            RTOEntry {
+                expires_at: Instant::now() + rto,
+                flags,
+                payload_len,
+            },
+        );
+    }
+
+    fn cancel_rto(&mut self, seq: u32) -> Option<RTOEntry> {
+        self.rtos.remove(&seq)
+    }
+
+    fn find_expired_rto(&self) -> Option<(&u32, &RTOEntry)> {
+        let now = Instant::now();
+        self.rtos.iter().find(|(_, timer)| timer.expires_at <= now)
+    }
+
+    fn find_rto_by_ack(&mut self, seg_ack: u32) -> Option<(&u32, &RTOEntry)> {
+        self.rtos.iter().find(|(&seq, _)| seq <= seg_ack)
+    }
 }
 
 /// The state of a TCB
@@ -94,8 +130,8 @@ pub struct Tcb {
     rcv_up: u32,
     /// RTO in (ms)
     rto: Duration,
-    /// RTOs for the current connection
-    timers: BTreeMap<u32, RTOEntry>,
+    /// Timers for the current connection
+    timers: TimerManager,
 }
 
 impl Tcb {
@@ -105,8 +141,8 @@ impl Tcb {
             listen_addr: addr,
             remote_addr: None,
             connection_type: ConnectionType::Passive,
-            tx_buffer: VecDeque::with_capacity(4096),
-            rx_buffer: VecDeque::with_capacity(4096),
+            tx_buffer: VecDeque::with_capacity(QUEUE_LIMIT),
+            rx_buffer: VecDeque::with_capacity(QUEUE_LIMIT),
             iss: rand::random::<u32>(),
             snd_una: 0,
             snd_nxt: 0,
@@ -119,7 +155,7 @@ impl Tcb {
             rcv_wnd: 4096,
             rcv_up: 0,
             rto: Duration::from_millis(200),
-            timers: BTreeMap::new(),
+            timers: TimerManager::new(),
         }
     }
 
@@ -138,24 +174,32 @@ impl Tcb {
         })
     }
 
-    pub fn has_data(&mut self) -> bool {
-        !self.rx_buffer.is_empty()
+    pub fn rx_is_empty(&self) -> bool {
+        self.rx_buffer.is_empty()
+    }
+
+    pub fn tx_is_empty(&self) -> bool {
+        self.tx_buffer.is_empty()
     }
 
     pub fn is_closing(&self) -> bool {
         matches!(self.state, State::CloseWait | State::Closed)
     }
 
+    pub fn is_open(&self) -> bool {
+        matches!(self.state, State::Estab)
+    }
+
     pub fn is_closed(&self) -> bool {
         matches!(self.state, State::Closed)
     }
 
-    fn rx_window(&self) -> u16 {
-        (self.rx_buffer.capacity() - self.rx_buffer.len()) as u16
+    fn rx_window(&self) -> usize {
+        self.rx_buffer.capacity() - self.rx_buffer.len()
     }
 
-    pub fn listen(&mut self) {
-        self.state = State::Listen;
+    fn tx_window(&self) -> usize {
+        self.tx_buffer.capacity() - self.tx_buffer.len()
     }
 
     fn segment_length(hdr: &etherparse::TcpHeaderSlice, len: usize) -> u32 {
@@ -180,7 +224,6 @@ impl Tcb {
         //
         //  >0      >0     RCV.NXT =< SEG.SEQ < RCV.NXT+RCV.WND
         //              or RCV.NXT =< SEG.SEQ+SEG.LEN-1 < RCV.NXT+RCV.WND
-
         let seg_seq = hdr.sequence_number();
         let seg_len = Self::segment_length(hdr, len);
         let seg_end = seg_seq.wrapping_add(seg_len - 1);
@@ -212,6 +255,31 @@ impl Tcb {
         false
     }
 
+    pub fn listen(&mut self) {
+        self.state = State::Listen;
+    }
+
+    pub fn init_closing(&mut self) {
+        if self.state != State::CloseWait {
+            return;
+        }
+        self.state = State::LastAck;
+    }
+
+    pub fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let available = self.rx_buffer.len();
+        let to_read = std::cmp::min(buf.len(), available);
+        let drained = self.rx_buffer.drain(..to_read).collect::<Vec<u8>>();
+        buf[..to_read].copy_from_slice(&drained);
+        Ok(to_read)
+    }
+
+    pub fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let to_write = std::cmp::min(self.tx_window(), buf.len());
+        self.tx_buffer.extend(&buf[..to_write]);
+        Ok(to_write)
+    }
+
     // half-establish a connection
     pub fn try_establish(
         &mut self,
@@ -230,81 +298,52 @@ impl Tcb {
         }
 
         /* security and precedence checks are skipped */
-
         let mut tcb = Tcb::new(cp.local);
         tcb.remote_addr = Some(cp.remote);
+
         if hdr.ack() {
-            tcb.write_rst(dev, hdr.acknowledgment_number())?;
+            tcb.send_rst(dev, hdr.acknowledgment_number())?;
         }
+
         if hdr.syn() {
             tcb.connection_type = ConnectionType::Passive;
             tcb.irs = hdr.sequence_number();
             tcb.rcv_nxt = hdr.sequence_number().wrapping_add(1);
-            tcb.rcv_wnd = tcb.rx_window();
+            tcb.rcv_wnd = tcb.rx_window() as u16;
             tcb.snd_una = tcb.iss;
             tcb.snd_nxt = tcb.iss.wrapping_add(1);
             tcb.state = State::SynRcvd;
+
             let flags = TcpFlags {
                 syn: true,
                 ..Default::default()
             };
             tcb.send(dev, tcb.iss, Some(tcb.rcv_nxt), &flags, &[])?;
-            self.timers.insert(
-                tcb.iss,
-                RTOEntry {
-                    expires_at: Instant::now() + self.rto,
-                    flags,
-                    payload_len: 0,
-                },
-            );
+            self.timers.start_rto(tcb.iss, flags, self.rto, 0);
             return Ok(Some(tcb));
         }
+
         Ok(None)
-    }
-
-    pub fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        // TODO: limit tx_buffer capacity, set up flow control
-        self.tx_buffer.extend(buf);
-        Ok(buf.len())
-    }
-
-    pub fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let available = self.rx_buffer.len();
-        let to_read = std::cmp::min(buf.len(), available);
-        let drained = self.rx_buffer.drain(..to_read).collect::<Vec<u8>>();
-        buf[..to_read].copy_from_slice(&drained);
-        Ok(to_read)
-    }
-
-    pub fn close(&mut self) {
-        if self.state != State::CloseWait {
-            return;
-        }
-        self.state = State::LastAck;
     }
 
     pub fn on_tick(&mut self, dev: &mut device::TunDevice) -> io::Result<()> {
         if !matches!(self.state, State::Estab | State::CloseWait | State::LastAck) {
             return Ok(());
         }
-
-        let now = Instant::now();
-        if let Some((&seq, _)) = self
-            .timers
-            .iter()
-            .find(|(_, timer)| timer.expires_at <= now)
-        {
-            let timer = self.timers.remove(&seq).unwrap();
+        if let Some((&seq, _)) = self.timers.find_expired_rto() {
+            let timer = self.timers.cancel_rto(seq).unwrap();
             let start = seq.wrapping_sub(self.snd_una) as usize;
             let end = start + timer.payload_len;
 
             println!("expired: local start_idx: {}, end_idx: {}", start, start);
 
             let payload: Vec<u8> = self.tx_buffer.range(start..end).copied().collect();
+
             println!(
                 "retransmitting: {:?}",
                 String::from_utf8_lossy(payload.as_slice())
             );
+
             self.send(
                 dev,
                 seq,
@@ -312,36 +351,35 @@ impl Tcb {
                 &timer.flags,
                 payload.as_slice(),
             )?;
+
+            // TODO: measure RTO properly
             self.rto *= 2;
-            self.timers.insert(
-                seq,
-                RTOEntry {
-                    expires_at: Instant::now() + self.rto,
-                    flags: timer.flags,
-                    payload_len: timer.payload_len,
-                },
-            );
-        } else if !self.tx_buffer.is_empty() {
+
+            self.timers
+                .start_rto(seq, timer.flags, self.rto, timer.payload_len);
+        } else if !self.tx_is_empty() {
             let available_wnd =
                 self.snd_wnd
                     .wrapping_sub((self.snd_nxt - self.snd_una) as u16) as usize;
+
             // no data can be sent, skip
             if available_wnd == 0 {
                 return Ok(());
             }
+
             let (head, tail) = self.tx_buffer.as_slices();
-            let to_be_written = std::cmp::min(available_wnd.min(TUN_MTU), self.tx_buffer.len());
-            let mut remaining = to_be_written;
+            let to_write = std::cmp::min(available_wnd.min(TUN_MTU), self.tx_buffer.len());
+            let mut remaining = to_write;
             let mut window_left = available_wnd;
             let mut cur_slice = head;
             let mut cur_pos = 0; // offset within cur_slice
             let mut seq = self.snd_nxt;
 
             /* send segments in batches */
-            while remaining > 0 && !self.tx_buffer.is_empty() && window_left > 0 {
+            while remaining > 0 && !self.tx_is_empty() && window_left > 0 {
                 let seg_size: usize =
                     std::cmp::min(remaining, (cur_slice.len() - cur_pos).min(window_left));
-                // TODO: data may be in flight already, check snd.una
+
                 let flags = TcpFlags {
                     psh: true,
                     ..Default::default()
@@ -354,20 +392,14 @@ impl Tcb {
                     &cur_slice[cur_pos..cur_pos + seg_size],
                 ) {
                     Ok(_) => {
-                        self.timers.insert(
-                            seq,
-                            RTOEntry {
-                                expires_at: Instant::now() + self.rto,
-                                flags,
-                                payload_len: seg_size,
-                            },
-                        );
+                        self.timers.start_rto(seq, flags, self.rto, seg_size);
                         seq = seq.wrapping_add(seg_size as u32);
                     }
                     Err(_) => {
                         break;
                     }
                 }
+
                 remaining -= seg_size;
                 window_left -= seg_size;
                 cur_pos += seg_size;
@@ -390,16 +422,10 @@ impl Tcb {
             };
             self.send(dev, seq, Some(self.rcv_nxt), &flags, &[])?;
             // syn & fin take one seq number, so they can be retransmitted
-            self.timers.insert(
-                seq,
-                RTOEntry {
-                    expires_at: Instant::now() + self.rto,
-                    flags,
-                    payload_len: 0,
-                },
-            );
+            self.timers.start_rto(seq, flags, self.rto, 0);
             self.snd_nxt += self.snd_nxt.wrapping_add(1);
         }
+
         Ok(())
     }
 
@@ -424,7 +450,7 @@ impl Tcb {
         if !matches!(self.state, State::Listen | State::SynSent | State::Closed)
             && !self.is_acceptable(tcph, payload.len())
         {
-            self.write_ack(dev)?;
+            self.send_ack(dev)?;
         }
         // check the RST bit
         if tcph.rst() {
@@ -443,9 +469,11 @@ impl Tcb {
                     // All segment queues should be flushed. Users should also receive an unsolicited general
                     // "connection reset" signal. Enter the CLOSED state, delete the
                     //TCB, and return.
+                    self.state = State::Closed;
                     return Err(io::Error::from(io::ErrorKind::ConnectionReset));
                 }
                 State::Closing | State::LastAck | State::TimeWait => {
+                    self.state = State::Closed;
                     return Err(io::Error::from(io::ErrorKind::ConnectionReset));
                 }
                 _ => {}
@@ -473,12 +501,13 @@ impl Tcb {
                 State::SynRcvd => match seg_ack > self.snd_una && seg_ack <= self.snd_nxt {
                     true => {
                         if tcph.rst() {
+                            self.state = State::Closed;
                             return Err(io::Error::from(io::ErrorKind::ConnectionReset));
                         }
                         self.state = State::Estab;
                     }
                     false => {
-                        self.write_rst(dev, tcph.sequence_number())?;
+                        self.send_rst(dev, tcph.sequence_number())?;
                     }
                 },
                 State::Estab | State::CloseWait => {
@@ -487,13 +516,14 @@ impl Tcb {
                         // remove everything up to seg_ack
                         self.tx_buffer.drain(..ack_idx.min(self.tx_buffer.len()));
                         self.snd_una = seg_ack;
+
                         // cancel the retransmit timer associated with the snd_una
-                        if let Some((&key, _)) = self.timers.iter().find(|(&seq, _)| seq <= seg_ack)
-                        {
-                            self.timers.remove(&key).unwrap();
+                        if let Some((&seq, _)) = self.timers.find_rto_by_ack(seg_ack) {
+                            self.timers.cancel_rto(seq).unwrap();
                             self.rto = Duration::from_millis(200);
-                            println!("canceled RTO for: {}", key);
+                            println!("canceled RTO for: {}", seq);
                         }
+
                         // updating the window from send sequence space
                         if self.snd_wl1 < seg_seq
                             || (self.snd_wl1 == seg_seq && self.snd_wl2 <= seg_ack)
@@ -505,13 +535,11 @@ impl Tcb {
                     }
                     if seg_ack > self.snd_una {
                         // If the ACK is duplicate it can be ignored
-                        println!("The ACK is duplicate");
                         return Ok(());
                     }
                     // If the ACK acks something not yet sent
                     if seg_ack > self.snd_nxt {
-                        println!("ACKing something not yet sent");
-                        return self.write_ack(dev);
+                        return self.send_ack(dev);
                     }
                 }
                 State::FinWait1 => {
@@ -557,9 +585,11 @@ impl Tcb {
             // process the segment text
             if !payload.is_empty() {
                 self.rx_buffer.extend(payload);
+
                 self.rcv_nxt = self.rcv_nxt.wrapping_add(payload.len() as u32);
-                self.rcv_wnd = self.rx_window();
-                self.write_ack(dev)?;
+                self.rcv_wnd = self.rx_window() as u16;
+
+                self.send_ack(dev)?;
                 read_cvar.notify_all();
             }
         }
@@ -567,16 +597,13 @@ impl Tcb {
         // SEG.SEQ cannot be validated in CLOSED, LISTEN or SYN-SENT, drop and return
         if tcph.fin() && !matches!(self.state, State::Closed | State::Listen | State::SynSent) {
             self.rcv_nxt = self.rcv_nxt.wrapping_add(1); // FIN bit takes 1 seq number
-            self.write_ack(dev)?;
-
-            println!("connection closing");
-            read_cvar.notify_all();
+            self.send_ack(dev)?;
+            read_cvar.notify_all(); // connection is half-closed, notify
 
             // send any remaining data?
             match self.state {
                 State::SynRcvd | State::Estab => {
                     self.state = State::CloseWait;
-                    // TODO: send FIN + start
                 }
                 State::FinWait1 => {
                     // TODO:
@@ -612,7 +639,7 @@ impl Tcb {
             if hdr.rst() {
                 return Ok(());
             }
-            return self.write_rst(dev, seg_ack);
+            return self.send_rst(dev, seg_ack);
         }
 
         match seg_ack >= self.snd_una && seg_ack <= self.snd_nxt {
@@ -632,15 +659,16 @@ impl Tcb {
             }
             if self.snd_una > self.iss {
                 self.state = State::Estab;
-                return self.send(
+                self.send(
                     dev,
                     self.snd_nxt,
                     Some(self.rcv_nxt),
                     &TcpFlags::default(),
                     &[],
-                );
+                )?;
             }
         }
+
         Ok(())
     }
 
@@ -652,35 +680,37 @@ impl Tcb {
     ) -> io::Result<()> {
         if !hdr.rst() {
             match hdr.ack() {
-                true => return self.write_rst(dev, hdr.sequence_number()),
+                true => return self.send_rst(dev, hdr.sequence_number()),
                 false => {
-                    return self.write_rst_ack(dev, hdr.sequence_number(), payload.len() as u32)
+                    return self.send_rst_ack(dev, hdr.sequence_number(), payload.len() as u32)
                 }
             }
         }
         Ok(())
     }
 
-    fn write_ack(&mut self, dev: &mut device::TunDevice) -> io::Result<()> {
+    fn send_ack(&mut self, dev: &mut device::TunDevice) -> io::Result<()> {
         self.send(
             dev,
             self.snd_nxt,
             Some(self.rcv_nxt),
             &TcpFlags::default(),
             &[],
-        )
+        )?;
+        Ok(())
     }
 
-    fn write_rst(&mut self, dev: &mut device::TunDevice, seq: u32) -> io::Result<()> {
+    fn send_rst(&mut self, dev: &mut device::TunDevice, seq: u32) -> io::Result<()> {
         self.rcv_wnd = 0;
         let flags = TcpFlags {
             rst: true,
             ..Default::default()
         };
-        self.send(dev, seq, None, &flags, &[])
+        self.send(dev, seq, None, &flags, &[])?;
+        Ok(())
     }
 
-    fn write_rst_ack(
+    fn send_rst_ack(
         &mut self,
         dev: &mut device::TunDevice,
         seq: u32,
@@ -692,17 +722,16 @@ impl Tcb {
             ..Default::default()
         };
         self.rcv_wnd = 0;
-        self.send(dev, 0, Some(seq.wrapping_add(seg_len)), &flags, &[])
+        self.send(dev, 0, Some(seq.wrapping_add(seg_len)), &flags, &[])?;
+        Ok(())
     }
 
-    fn send(
+    fn build_tcp_header(
         &self,
-        dev: &mut device::TunDevice,
         seq: u32,
         ack: Option<u32>,
         flags: &TcpFlags,
-        payload: &[u8],
-    ) -> io::Result<()> {
+    ) -> etherparse::TcpHeader {
         let mut th = etherparse::TcpHeader::new(
             self.listen_addr.port(),
             self.remote_addr.unwrap().port(),
@@ -718,16 +747,28 @@ impl Tcb {
         th.psh = flags.psh;
         th.rst = flags.rst;
 
+        th
+    }
+
+    fn send(
+        &self,
+        dev: &mut device::TunDevice,
+        seq: u32,
+        ack: Option<u32>,
+        flags: &TcpFlags,
+        payload: &[u8],
+    ) -> io::Result<usize> {
+        // calculate length and checksum
         let builder = etherparse::PacketBuilder::ipv4(
             self.listen_addr.ip().octets(),
             self.remote_addr.unwrap().ip().octets(),
             HOP_LIMIT,
         )
-        .tcp_header(th);
+        .tcp_header(self.build_tcp_header(seq, ack, flags));
 
         let mut datagram = Vec::<u8>::with_capacity(builder.size(payload.len()));
         match builder.write(&mut datagram, payload) {
-            Ok(_) => dev.write_all(datagram.as_slice()),
+            Ok(_) => dev.write(datagram.as_slice()),
             Err(_) => Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
                 "Packet serialization failed",
