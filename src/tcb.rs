@@ -86,6 +86,15 @@ pub struct ConnectionPair {
     pub remote: SocketAddrV4,
 }
 
+impl Default for ConnectionPair {
+    fn default() -> Self {
+        Self {
+            local: SocketAddrV4::new([0; 4].into(), 0),
+            remote: SocketAddrV4::new([0; 4].into(), 0),
+        }
+    }
+}
+
 #[derive(Eq, PartialEq, Debug)]
 pub enum ConnectionType {
     Active,
@@ -97,7 +106,7 @@ pub struct Tcb {
     /// TCB state
     state: State,
     /// Local address specified with listen()
-    listen_addr: SocketAddrV4,
+    local_addr: SocketAddrV4,
     /// Remote address obtained in listen
     remote_addr: Option<SocketAddrV4>,
     /// Determines whether it's a client or a server
@@ -138,7 +147,7 @@ impl Tcb {
     pub fn new(addr: SocketAddrV4) -> Self {
         Self {
             state: State::Closed,
-            listen_addr: addr,
+            local_addr: addr,
             remote_addr: None,
             connection_type: ConnectionType::Passive,
             tx_buffer: VecDeque::with_capacity(QUEUE_LIMIT),
@@ -160,7 +169,7 @@ impl Tcb {
     }
 
     pub fn listen_addr(&self) -> SocketAddrV4 {
-        self.listen_addr
+        self.local_addr
     }
 
     pub fn remote_addr(&self) -> Option<SocketAddrV4> {
@@ -733,7 +742,7 @@ impl Tcb {
         flags: &TcpFlags,
     ) -> etherparse::TcpHeader {
         let mut th = etherparse::TcpHeader::new(
-            self.listen_addr.port(),
+            self.local_addr.port(),
             self.remote_addr.unwrap().port(),
             seq,
             self.rcv_wnd,
@@ -760,7 +769,7 @@ impl Tcb {
     ) -> io::Result<usize> {
         // calculate length and checksum
         let builder = etherparse::PacketBuilder::ipv4(
-            self.listen_addr.ip().octets(),
+            self.local_addr.ip().octets(),
             self.remote_addr.unwrap().ip().octets(),
             HOP_LIMIT,
         )
