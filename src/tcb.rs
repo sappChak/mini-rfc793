@@ -1,12 +1,15 @@
 use std::{
     collections::{BTreeMap, VecDeque},
     io::{self, Write},
-    net::SocketAddrV4,
+    net::SocketAddr,
     sync::Condvar,
     time::{Duration, Instant},
 };
 
-use crate::{device, TUN_MTU};
+use crate::{
+    connections::{ConnectionType, Tuple},
+    device, TUN_MTU,
+};
 
 /// TTL for IPv4
 const HOP_LIMIT: u8 = 64;
@@ -80,37 +83,18 @@ pub enum State {
     Closed,
 }
 
-#[derive(Hash, Eq, PartialEq, Debug, Clone, Copy)]
-pub struct ConnectionPair {
-    pub local: SocketAddrV4,
-    pub remote: SocketAddrV4,
-}
-
-impl Default for ConnectionPair {
-    fn default() -> Self {
-        Self {
-            local: SocketAddrV4::new([0; 4].into(), 0),
-            remote: SocketAddrV4::new([0; 4].into(), 0),
-        }
-    }
-}
-
-#[derive(Eq, PartialEq, Debug)]
-pub enum ConnectionType {
-    Active,
-    Passive,
-}
-
 /// Transmission Control Block
 pub struct Tcb {
     /// TCB state
     state: State,
     /// Local address specified with listen()
-    local_addr: SocketAddrV4,
+    local_addr: SocketAddr,
     /// Remote address obtained in listen
-    remote_addr: Option<SocketAddrV4>,
+    remote_addr: Option<SocketAddr>,
     /// Determines whether it's a client or a server
     connection_type: ConnectionType,
+    /// 4-Tuple
+    tuple: Option<Tuple>,
     /// Transmit buffer
     tx_buffer: VecDeque<u8>,
     /// Receive buffer
@@ -144,12 +128,13 @@ pub struct Tcb {
 }
 
 impl Tcb {
-    pub fn new(addr: SocketAddrV4) -> Self {
+    pub fn new(addr: SocketAddr) -> Self {
         Self {
             state: State::Closed,
             local_addr: addr,
             remote_addr: None,
             connection_type: ConnectionType::Passive,
+            tuple: None,
             tx_buffer: VecDeque::with_capacity(QUEUE_LIMIT),
             rx_buffer: VecDeque::with_capacity(QUEUE_LIMIT),
             iss: rand::random::<u32>(),
@@ -168,19 +153,16 @@ impl Tcb {
         }
     }
 
-    pub fn listen_addr(&self) -> SocketAddrV4 {
+    pub fn listen_addr(&self) -> SocketAddr {
         self.local_addr
     }
 
-    pub fn remote_addr(&self) -> Option<SocketAddrV4> {
+    pub fn remote_addr(&self) -> Option<SocketAddr> {
         self.remote_addr
     }
 
-    pub fn pair(&self) -> Option<ConnectionPair> {
-        self.remote_addr().map(|remote_addr| ConnectionPair {
-            local: self.listen_addr(),
-            remote: remote_addr,
-        })
+    pub fn tuple(&self) -> Option<Tuple> {
+        self.tuple
     }
 
     pub fn rx_is_empty(&self) -> bool {
@@ -294,7 +276,7 @@ impl Tcb {
         &mut self,
         dev: &mut device::TunDevice,
         hdr: &etherparse::TcpHeaderSlice,
-        cp: ConnectionPair,
+        tuple: Tuple,
     ) -> io::Result<Option<Tcb>> {
         if self.state != State::Listen {
             return Err(io::Error::new(
@@ -307,8 +289,9 @@ impl Tcb {
         }
 
         /* security and precedence checks are skipped */
-        let mut tcb = Tcb::new(cp.local);
-        tcb.remote_addr = Some(cp.remote);
+        let mut tcb = Tcb::new(tuple.local_ip());
+        tcb.remote_addr = Some(tuple.remote_ip());
+        tcb.tuple = Some(tuple);
 
         if hdr.ack() {
             tcb.send_rst(dev, hdr.acknowledgment_number())?;
@@ -767,12 +750,24 @@ impl Tcb {
         flags: &TcpFlags,
         payload: &[u8],
     ) -> io::Result<usize> {
-        // calculate length and checksum
-        let builder = etherparse::PacketBuilder::ipv4(
-            self.local_addr.ip().octets(),
-            self.remote_addr.unwrap().ip().octets(),
-            HOP_LIMIT,
-        )
+        let cp = match self.tuple {
+            Some(cp) => cp,
+            None => panic!("I don't have whom to send"),
+        };
+
+        // calculate checksum and length
+        let builder = match cp {
+            Tuple::V4(cp_v4) => etherparse::PacketBuilder::ipv4(
+                cp_v4.local.ip().octets(),
+                cp_v4.remote.ip().octets(),
+                HOP_LIMIT,
+            ),
+            Tuple::V6(cp_v6) => etherparse::PacketBuilder::ipv6(
+                cp_v6.local.ip().octets(),
+                cp_v6.remote.ip().octets(),
+                HOP_LIMIT,
+            ),
+        }
         .tcp_header(self.build_tcp_header(seq, ack, flags));
 
         let mut datagram = Vec::<u8>::with_capacity(builder.size(payload.len()));

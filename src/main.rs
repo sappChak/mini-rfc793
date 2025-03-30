@@ -1,13 +1,18 @@
-use std::sync::Arc;
+use std::{net::SocketAddr, sync::Arc};
 
-use mini_tcp::{device, packet_loop, ConnectionManager, TcpListener, TcpStream};
+use mini_tcp::{
+    connections::ConnectionManager,
+    device,
+    ip::packet_loop,
+    tcp::{TcpListener, TcpStream},
+};
 
-fn handle_stream(mut stream: TcpStream) -> std::io::Result<()> {
+fn handle_stream(mut stream: TcpStream, addr: SocketAddr) -> std::io::Result<()> {
     let mut buffer = [0; 512];
     loop {
         match stream.read(&mut buffer) {
             Ok(0) => {
-                println!("Client disconnected!");
+                println!("Client {} disconnected!", addr);
                 break;
             }
             Ok(n) => {
@@ -38,10 +43,11 @@ fn main() -> std::io::Result<()> {
     });
 
     let addr = "10.0.0.56:3001".parse().unwrap();
-    let mut listener = TcpListener::bind(addr, mgr.clone()).unwrap();
+    let listener = TcpListener::bind(addr, mgr.clone()).unwrap();
     while let Ok((stream, addr)) = listener.accept() {
         println!("accepted a connection from address: {addr}");
-        std::thread::spawn(move || handle_stream(stream));
+        std::thread::spawn(move || handle_stream(stream, addr));
     }
+
     Ok(())
 }

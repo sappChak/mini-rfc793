@@ -1,8 +1,8 @@
-use crate::{socket::Socket, ConnectionManager};
+use crate::{connections::ConnectionManager, socket::Socket};
 
 use std::{
     io::{self},
-    net::SocketAddrV4,
+    net::SocketAddr,
     sync::Arc,
 };
 
@@ -11,14 +11,17 @@ pub struct TcpListener {
 }
 
 impl TcpListener {
-    pub fn bind(addr: SocketAddrV4, conn_mgr: Arc<ConnectionManager>) -> io::Result<TcpListener> {
-        let mut sock = Socket::new(conn_mgr.clone());
+    pub fn bind(addr: SocketAddr, manager: Arc<ConnectionManager>) -> io::Result<TcpListener> {
+        let mut sock = Socket::new(addr, manager.clone());
+        // Bind socket
         sock.bind(addr)?;
+
+        // Start listening
         sock.listen();
         Ok(TcpListener { inner: sock })
     }
 
-    pub fn accept(&self) -> io::Result<(TcpStream, SocketAddrV4)> {
+    pub fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
         let sock = self.inner.accept()?;
         let addr = sock.remote_addr();
         Ok((TcpStream { inner: sock }, addr))
@@ -30,7 +33,7 @@ pub struct TcpStream {
 }
 
 impl TcpStream {
-    pub fn connect(_addr: SocketAddrV4) -> io::Result<TcpStream> {
+    pub fn connect(_addr: SocketAddr) -> io::Result<TcpStream> {
         unimplemented!()
     }
 

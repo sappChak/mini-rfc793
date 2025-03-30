@@ -1,34 +1,47 @@
-use std::{collections::hash_map::Entry, io, net::SocketAddrV4, sync::Arc};
+use std::{collections::hash_map::Entry, io, net::SocketAddr, sync::Arc};
 
 use crate::{
-    tcb::{ConnectionPair, Tcb},
-    ConnectionManager,
+    connections::{ConnectionManager, Tuple, TupleV4, TupleV6},
+    tcb::Tcb,
 };
 
 pub struct Socket {
     manager: Arc<ConnectionManager>,
-    pair: ConnectionPair,
+    tuple: Tuple,
 }
 
 impl Socket {
-    pub fn new(manager: Arc<ConnectionManager>) -> Self {
-        Self {
+    pub fn new(addr: SocketAddr, manager: Arc<ConnectionManager>) -> Socket {
+        let tuple = match addr {
+            SocketAddr::V4(_) => Tuple::V4(TupleV4::default()),
+            SocketAddr::V6(_) => Tuple::V6(TupleV6::default()),
+        };
+        Socket {
             manager,
-            pair: ConnectionPair::default(),
+            tuple,
         }
     }
 
-    pub fn remote_addr(&self) -> SocketAddrV4 {
-        self.pair.remote
+    pub fn remote_addr(&self) -> SocketAddr {
+        match self.tuple {
+            Tuple::V4(tuple_v4) => SocketAddr::V4(tuple_v4.remote),
+            Tuple::V6(tuple_v6) => SocketAddr::V6(tuple_v6.remote),
+        }
     }
 
-    pub fn connect(addr: SocketAddrV4) -> io::Result<Self> {
+    pub fn local_port(&self) -> u16 {
+        match self.tuple {
+            Tuple::V4(tuple_v4) => tuple_v4.local.port(),
+            Tuple::V6(tuple_v6) => tuple_v6.local.port(),
+        }
+    }
+
+    pub fn connect(_addr: SocketAddr) -> io::Result<Socket> {
         unimplemented!()
     }
 
-    pub fn bind(&mut self, addr: SocketAddrV4) -> io::Result<()> {
+    pub fn bind(&mut self, addr: SocketAddr) -> io::Result<()> {
         let tcb = Tcb::new(addr);
-
         let mut conns = self.manager.connections();
         match conns.bound.entry(addr.port()) {
             Entry::Occupied(_) => {
@@ -38,37 +51,54 @@ impl Socket {
                 ))
             }
             Entry::Vacant(vacant) => {
-                self.pair.local = addr;
+                match self.tuple {
+                    Tuple::V4(ref mut tuple_v4) => {
+                        tuple_v4.local = match addr {
+                            SocketAddr::V4(socket_addr_v4) => socket_addr_v4,
+                            SocketAddr::V6(_) => {
+                                panic!("socket was created with AF_INET!");
+                            }
+                        }
+                    }
+                    Tuple::V6(ref mut tuple_v6) => {
+                        tuple_v6.local = match addr {
+                            SocketAddr::V4(_) => {
+                                panic!("socket was created with AF_INET6!");
+                            }
+                            SocketAddr::V6(socket_addr_v6) => socket_addr_v6,
+                        }
+                    }
+                }
                 vacant.insert(tcb);
             }
         }
-
         Ok(())
     }
 
     pub fn listen(&mut self) {
+        let port = self.local_port();
         let mut conns = self.manager.connections();
-        if let Some(tcb) = conns.bound.get_mut(&self.pair.local.port()) {
-            println!("Listening on port {}", self.pair.local.port());
+        if let Some(tcb) = conns.bound.get_mut(&port) {
+            println!("listening on port {}", port);
             tcb.listen();
         }
     }
 
-    pub fn accept(&self) -> io::Result<Self> {
+    pub fn accept(&self) -> io::Result<Socket> {
         loop {
             let mut conns = self.manager.connections();
             while conns.pending.is_empty() {
                 conns = self.manager.pending_cvar.wait(conns).unwrap();
             }
             if let Some(tcb) = conns.pending.pop_front() {
-                let cp = ConnectionPair {
-                    local: tcb.listen_addr(),
-                    remote: tcb.remote_addr().unwrap(),
+                let tuple = match tcb.remote_addr() {
+                    Some(remote_addr) => Tuple::new(tcb.listen_addr(), remote_addr),
+                    None => panic!("shouldn't have happened!"),
                 };
-                conns.established.insert(cp, tcb);
+                conns.established.insert(tuple, tcb);
                 return Ok(Self {
                     manager: self.manager.clone(),
-                    pair: cp,
+                    tuple,
                 });
             }
         }
@@ -77,7 +107,7 @@ impl Socket {
     pub fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let mut conns = self.manager.connections();
         loop {
-            match conns.established.get_mut(&self.pair) {
+            match conns.established.get_mut(&self.tuple) {
                 Some(tcb) => {
                     if !tcb.rx_is_empty() {
                         return tcb.read(buf);
@@ -94,7 +124,7 @@ impl Socket {
 
     pub fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let mut conns = self.manager.connections();
-        match conns.established.get_mut(&self.pair) {
+        match conns.established.get_mut(&self.tuple) {
             Some(tcb) => tcb.write(buf),
             None => Ok(0),
         }
@@ -102,7 +132,7 @@ impl Socket {
 
     pub fn close(&self) {
         let mut conns = self.manager.connections();
-        if let Some(tcb) = conns.established.get_mut(&self.pair) {
+        if let Some(tcb) = conns.established.get_mut(&self.tuple) {
             tcb.init_closing()
         }
     }
