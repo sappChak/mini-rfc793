@@ -5,6 +5,8 @@ edition = "2021"
 
 [dependencies]
 tun-rs = "2"
+tracing = "0.1"
+tracing-subscriber = "0.3"
 etherparse = "0.17"
 rand = "0.9"
 libc = "0.2"
