@@ -1,84 +1,52 @@
-## RFC 793 (TCP) protocol implementation using a TUN device
+## Userspace TCP protocol implementation using TUN device
 
-### Send Sequence Space:
+This project is a minimal, custom implementation of the Transmission Control Protocol
+(TCP), as defined in [RFC 793](https://www.rfc-editor.org/rfc/rfc793.html), operating entirely in userspace. It leverages a TUN virtual
+network device to process IPv4 and IPv6 packets. The purpose of this project is purely
+educational.
 
-                                   1         2          3          4
-                              ----------|----------|----------|----------
-                                     SND.UNA    SND.NXT    SND.UNA
-                                                          +SND.WND
+## Prerequisites
 
-                        1 - old sequence numbers which have been acknowledged
-                        2 - sequence numbers of unacknowledged data
-                        3 - sequence numbers allowed for new data transmission
-                        4 - future sequence numbers which are not yet allowed
+- Administrative privileges to create and configure TUN devices.
+- Tools:
+  - `tcpdump`: Packet analyzer.
+  - `netcat`: Networking utility for testing.
 
-                                          Send Sequence Space
+## Usage
 
-### Receive Sequence Space
+### 1. Compile and run
 
-                                       1          2          3
-                                   ----------|----------|----------
-                                          RCV.NXT    RCV.NXT
-                                                    +RCV.WND
+The `run.sh` script executes the binary with `sudo` to create a TUN device (see `device.rs`), which requires root privileges
+due to its interaction with the network stack.
 
-                        1 - old sequence numbers which have been acknowledged
-                        2 - sequence numbers allowed for new reception
-                        3 - future sequence numbers which are not yet allowed
+```bash
+./scripts/run.sh
+```
 
-                                         Receive Sequence Space
+### 2. Monitor network traffic
 
-### Notes from RFC793
+Capture and inspect TCP packets on the `tun0` interface using `tcpdump`:
 
-When the TCP transmits a segment containing data, it puts a copy on a retransmission queue and starts a timer; when the acknowledgment for that data is received, the segment is deleted from the queue. If the acknowledgment is not
-received before the timer runs out, the segment is retransmitted.
+```bash
+sudo tcpdump -i tun0 tcp -n
+```
 
-The TCP does not call on the
-network device driver directly, but rather calls on the internet
-datagram protocol module which may in turn call on the device driver.
+### 3. Test with a client
 
-We envision that processes
-may "own" ports, and that processes can initiate connections only on
-the ports they own. (Means for implementing ownership is a local
-issue, but we envision a Request Port user command, or a method of
-uniquely allocating a group of ports to a given process, e.g., by
-associating the high order bits of a port name with a given process.)
+Use `netcat` to establish a TCP connection to the server. The host portions and ports are
+up to you:
 
-There are two principal cases for matching the sockets in the local
-passive OPENs and an foreign active OPENs. In the first case, the
-local passive OPENs has fully specified the foreign socket. In this
-case, the match must be exact. In the second case, the local passive
-OPENs has left the foreign socket unspecified. In this case, any
-foreign socket is acceptable as long as the local sockets match.
-Other possibilities include partially restricted matches.
+```bash
+nc -N 10.10.0.10 8080
+```
 
-When a receiving TCP sees the PUSH flag, it must not wait for more data from
-the sending TCP before passing the data to the receiving process.
+or/both(as the program spawns 2 listeners):
 
-Among the variables stored in the TCB are the local and remote socket numbers, the security and
-precedence of the connection, pointers to the user's send and receive
-buffers, pointers to the retransmit queue and to the current segment.
-In addition several variables relating to the send and receive
-sequence numbers are stored in the TCB.
+```bash
+nc -N fd00:dead:beef::10 8081
+```
 
-It is essential to remember that the actual sequence number space is
-finite, though very large. This space ranges from 0 to 2**32 - 1.
-Since the space is finite, all arithmetic dealing with sequence
-numbers must be performed modulo 2**32. This unsigned arithmetic
-preserves the relationship of sequence numbers as they cycle from
-2\*\*32 - 1 to 0 again.
+## Acknowledgments
 
-Note that when the receive window is zero no segments should be
-acceptable except ACK segments. Thus, it is be possible for a TCP to
-maintain a zero receive window while transmitting data and receiving
-ACKs. However, even when the receive window is zero, a TCP must
-process the RST and URG fields of all incoming segments.
-
-The CLOSE user call implies a push function, as does the FIN control
-flag in an incoming segment.
-
-If more data
-arrives than can be accepted, it will be discarded. This will result
-in excessive retransmissions, adding unnecessarily to the load on the
-network and the TCPs. Indicating a small window may restrict the
-transmission of data to the point of introducing a round trip delay
-between each new segment transmitted.
+- Portions of the connection management logic are inspired by Jon Gjengset’s TCP implementation.
+- Socket API design influenced by Rust's `std::net` module.
