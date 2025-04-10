@@ -125,9 +125,9 @@ impl Connections {
 
 #[derive(Default)]
 pub struct ConnectionManager {
-    pub connections: Mutex<Connections>,
-    pub pending_cvar: Condvar,
-    pub read_cvar: Condvar,
+    connections: Mutex<Connections>,
+    pending_cvar: Condvar,
+    read_cvar: Condvar,
 }
 
 impl ConnectionManager {
@@ -141,5 +141,13 @@ impl ConnectionManager {
 
     pub fn connections(&self) -> std::sync::MutexGuard<Connections> {
         self.connections.lock().unwrap()
+    }
+
+    pub fn read_cvar(&self) -> &Condvar {
+        &self.read_cvar
+    }
+
+    pub fn pending_cvar(&self) -> &Condvar {
+        &self.pending_cvar
     }
 }

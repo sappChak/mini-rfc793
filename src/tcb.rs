@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, VecDeque},
-    io::{self, Write},
+    io::{self},
     net::SocketAddr,
     sync::Condvar,
     time::{Duration, Instant},
@@ -107,8 +107,6 @@ pub struct Tcb {
     snd_nxt: u32,
     /// Available buffer space for sending
     snd_wnd: u16,
-    /// Used for urgent data
-    snd_up: u32,
     /// Last segment’s sequence number for window update
     snd_wl1: u32,
     /// Last segment’s acknowledgment number for window update
@@ -119,8 +117,6 @@ pub struct Tcb {
     rcv_nxt: u32,
     /// Available buffer space for receiving
     rcv_wnd: u16,
-    /// Used for urgent data
-    rcv_up: u32,
     /// RTO in (ms)
     rto: Duration,
     /// Timers for the current connection
@@ -143,11 +139,9 @@ impl Tcb {
             snd_wnd: 0,
             snd_wl1: 0,
             snd_wl2: 0,
-            snd_up: 0,
             irs: 0,
             rcv_nxt: 0,
             rcv_wnd: 4096,
-            rcv_up: 0,
             rto: Duration::from_millis(200),
             timers: TimerManager::new(),
         }
@@ -772,7 +766,7 @@ impl Tcb {
 
         let mut datagram = Vec::<u8>::with_capacity(builder.size(payload.len()));
         match builder.write(&mut datagram, payload) {
-            Ok(_) => dev.write(datagram.as_slice()),
+            Ok(_) => dev.send(datagram.as_slice()),
             Err(_) => Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
                 "Packet serialization failed",

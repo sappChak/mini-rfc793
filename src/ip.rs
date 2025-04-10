@@ -1,6 +1,6 @@
 use std::{
     collections::hash_map::Entry,
-    io::{self, Read},
+    io::{self},
     net::{SocketAddrV4, SocketAddrV6},
     sync::Arc,
 };
@@ -10,18 +10,18 @@ use crate::{
     device, TUN_MTU,
 };
 
-pub fn packet_loop(dev: &mut device::TunDevice, manager: Arc<ConnectionManager>) -> io::Result<()> {
+pub fn packet_loop(dev: &mut device::TunDevice, mgr: Arc<ConnectionManager>) -> io::Result<()> {
     let mut buf = [0u8; TUN_MTU]; // MTU
     loop {
-        let mut conns = manager.connections();
+        let mut conns = mgr.connections();
         for tcb in conns.established.values_mut() {
             tcb.on_tick(dev)?;
         }
         drop(conns);
-        match dev.read(&mut buf) {
+        match dev.recv(&mut buf) {
             Ok(n) => {
                 let pkt = &buf[0..n];
-                process_packet(dev, manager.clone(), pkt)?;
+                process_packet(dev, mgr.clone(), pkt)?;
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
             Err(e) => return Err(e),
@@ -31,7 +31,7 @@ pub fn packet_loop(dev: &mut device::TunDevice, manager: Arc<ConnectionManager>)
 
 fn process_packet(
     dev: &mut device::TunDevice,
-    manager: Arc<ConnectionManager>,
+    mgr: Arc<ConnectionManager>,
     pkt: &[u8],
 ) -> io::Result<()> {
     if let Ok(ipv4_hdr) = etherparse::Ipv4HeaderSlice::from_slice(pkt) {
@@ -51,19 +51,17 @@ fn process_packet(
                     local: SocketAddrV4::new(dest, tcph.destination_port()),
                     remote: SocketAddrV4::new(src, tcph.source_port()),
                 });
-                process_tcp_slice(dev, manager.clone(), tcph, payload, tuple)?;
+                process_tcp_slice(dev, mgr.clone(), tcph, payload, tuple)?;
             }
             Err(e) => println!("error parsing TCP segment {:?}", e),
         }
     } else if let Ok(ipv6_hdr) = etherparse::Ipv6HeaderSlice::from_slice(pkt) {
         let src = ipv6_hdr.source_addr();
         let dest = ipv6_hdr.destination_addr();
-
         // Reject everything not TCP for now
         if ipv6_hdr.next_header() != etherparse::IpNumber::TCP {
             return Ok(());
         }
-
         let tcp_offset: usize = ipv6_hdr.slice().len();
         match etherparse::TcpHeaderSlice::from_slice(&pkt[tcp_offset..]) {
             Ok(tcph) => {
@@ -74,7 +72,7 @@ fn process_packet(
                     local: SocketAddrV6::new(dest, tcph.destination_port(), 0, 0),
                     remote: SocketAddrV6::new(src, tcph.source_port(), 0, 0),
                 });
-                process_tcp_slice(dev, manager.clone(), tcph, payload, tuple)?;
+                process_tcp_slice(dev, mgr.clone(), tcph, payload, tuple)?;
             }
             Err(e) => println!("error parsing TCP segment {:?}", e),
         }
@@ -85,19 +83,19 @@ fn process_packet(
 
 fn process_tcp_slice(
     dev: &mut device::TunDevice,
-    manager: Arc<ConnectionManager>,
+    mgr: Arc<ConnectionManager>,
     tcph: etherparse::TcpHeaderSlice,
     payload: &[u8],
     tuple: Tuple,
 ) -> io::Result<()> {
-    let mut conns = manager.connections.lock().unwrap();
+    let mut conns = mgr.connections();
 
     match conns.established.entry(tuple) {
         Entry::Vacant(_) => {
             // it's likely, the connection was already initialized:
             if let Some(client) = conns.find_in_pending(tuple) {
-                client.on_segment(dev, &tcph, payload, &manager.read_cvar)?;
-                manager.pending_cvar.notify_all(); // notify accept() about an established connection
+                client.on_segment(dev, &tcph, payload, mgr.read_cvar())?;
+                mgr.pending_cvar().notify_all(); // notify accept() about an established connection
                 return Ok(());
             }
             // connection wasn't initialized, try to establish one
@@ -108,15 +106,12 @@ fn process_tcp_slice(
             }
         }
         Entry::Occupied(mut o) => {
-            if let Err(error) = o
-                .get_mut()
-                .on_segment(dev, &tcph, payload, &manager.read_cvar)
-            {
+            if let Err(error) = o.get_mut().on_segment(dev, &tcph, payload, mgr.read_cvar()) {
                 match error.kind() {
                     io::ErrorKind::ConnectionRefused | io::ErrorKind::ConnectionReset => {
                         println!("removing a connection: {:?}", &tuple);
                         conns.established.remove(&tuple);
-                        manager.read_cvar.notify_all();
+                        mgr.read_cvar().notify_all();
                     }
                     _ => {}
                 }

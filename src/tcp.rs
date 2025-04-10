@@ -11,12 +11,9 @@ pub struct TcpListener {
 }
 
 impl TcpListener {
-    pub fn bind(addr: SocketAddr, manager: Arc<ConnectionManager>) -> io::Result<TcpListener> {
-        let mut sock = Socket::new(addr, manager.clone());
-        // Bind socket
+    pub fn bind(addr: SocketAddr, mgr: Arc<ConnectionManager>) -> io::Result<TcpListener> {
+        let mut sock = Socket::new(addr, mgr.clone());
         sock.bind(addr)?;
-
-        // Start listening
         sock.listen();
         Ok(TcpListener { inner: sock })
     }

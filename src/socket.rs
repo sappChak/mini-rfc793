@@ -6,20 +6,17 @@ use crate::{
 };
 
 pub struct Socket {
-    manager: Arc<ConnectionManager>,
+    mgr: Arc<ConnectionManager>,
     tuple: Tuple,
 }
 
 impl Socket {
-    pub fn new(addr: SocketAddr, manager: Arc<ConnectionManager>) -> Socket {
+    pub fn new(addr: SocketAddr, mgr: Arc<ConnectionManager>) -> Socket {
         let tuple = match addr {
             SocketAddr::V4(_) => Tuple::V4(TupleV4::default()),
             SocketAddr::V6(_) => Tuple::V6(TupleV6::default()),
         };
-        Socket {
-            manager,
-            tuple,
-        }
+        Socket { mgr, tuple }
     }
 
     pub fn remote_addr(&self) -> SocketAddr {
@@ -42,7 +39,7 @@ impl Socket {
 
     pub fn bind(&mut self, addr: SocketAddr) -> io::Result<()> {
         let tcb = Tcb::new(addr);
-        let mut conns = self.manager.connections();
+        let mut conns = self.mgr.connections();
         match conns.bound.entry(addr.port()) {
             Entry::Occupied(_) => {
                 return Err(io::Error::new(
@@ -77,7 +74,7 @@ impl Socket {
 
     pub fn listen(&mut self) {
         let port = self.local_port();
-        let mut conns = self.manager.connections();
+        let mut conns = self.mgr.connections();
         if let Some(tcb) = conns.bound.get_mut(&port) {
             println!("listening on port {}", port);
             tcb.listen();
@@ -86,9 +83,9 @@ impl Socket {
 
     pub fn accept(&self) -> io::Result<Socket> {
         loop {
-            let mut conns = self.manager.connections();
+            let mut conns = self.mgr.connections();
             while conns.pending.is_empty() {
-                conns = self.manager.pending_cvar.wait(conns).unwrap();
+                conns = self.mgr.pending_cvar().wait(conns).unwrap();
             }
             if let Some(tcb) = conns.pending.pop_front() {
                 let tuple = match tcb.remote_addr() {
@@ -97,7 +94,7 @@ impl Socket {
                 };
                 conns.established.insert(tuple, tcb);
                 return Ok(Self {
-                    manager: self.manager.clone(),
+                    mgr: self.mgr.clone(),
                     tuple,
                 });
             }
@@ -105,7 +102,7 @@ impl Socket {
     }
 
     pub fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let mut conns = self.manager.connections();
+        let mut conns = self.mgr.connections();
         loop {
             match conns.established.get_mut(&self.tuple) {
                 Some(tcb) => {
@@ -115,7 +112,7 @@ impl Socket {
                     if tcb.is_closing() {
                         return Ok(0);
                     }
-                    conns = self.manager.read_cvar.wait(conns).unwrap();
+                    conns = self.mgr.read_cvar().wait(conns).unwrap();
                 }
                 None => return Ok(0),
             }
@@ -123,7 +120,7 @@ impl Socket {
     }
 
     pub fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let mut conns = self.manager.connections();
+        let mut conns = self.mgr.connections();
         match conns.established.get_mut(&self.tuple) {
             Some(tcb) => tcb.write(buf),
             None => Ok(0),
@@ -131,7 +128,7 @@ impl Socket {
     }
 
     pub fn close(&self) {
-        let mut conns = self.manager.connections();
+        let mut conns = self.mgr.connections();
         if let Some(tcb) = conns.established.get_mut(&self.tuple) {
             tcb.init_closing()
         }
