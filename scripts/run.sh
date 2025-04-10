@@ -1,3 +1,3 @@
 #!/bin/sh
 cargo build --release
-sudo ./target/release/mini-tcp
+sudo RUST_LOG=info ./target/release/mini-tcp

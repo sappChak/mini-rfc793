@@ -321,11 +321,11 @@ impl Tcb {
             let start = seq.wrapping_sub(self.snd_una) as usize;
             let end = start + timer.payload_len;
 
-            println!("expired: local start_idx: {}, end_idx: {}", start, start);
+            tracing::debug!("expired: local start_idx: {}, end_idx: {}", start, start);
 
             let payload: Vec<u8> = self.tx_buffer.range(start..end).copied().collect();
 
-            println!(
+            tracing::debug!(
                 "retransmitting: {:?}",
                 String::from_utf8_lossy(payload.as_slice())
             );
@@ -354,7 +354,7 @@ impl Tcb {
             }
 
             let (head, tail) = self.tx_buffer.as_slices();
-            let to_write = std::cmp::min(available_wnd.min(TUN_MTU), self.tx_buffer.len());
+            let to_write = std::cmp::min(available_wnd.min(TUN_MTU as usize), self.tx_buffer.len());
             let mut remaining = to_write;
             let mut window_left = available_wnd;
             let mut cur_slice = head;
@@ -507,7 +507,7 @@ impl Tcb {
                         if let Some((&seq, _)) = self.timers.find_rto_by_ack(seg_ack) {
                             self.timers.cancel_rto(seq).unwrap();
                             self.rto = Duration::from_millis(200);
-                            println!("canceled RTO for: {}", seq);
+                            tracing::debug!("canceled RTO for: {}", seq);
                         }
 
                         // updating the window from send sequence space
@@ -744,10 +744,9 @@ impl Tcb {
         flags: &TcpFlags,
         payload: &[u8],
     ) -> io::Result<usize> {
-        let cp = match self.tuple {
-            Some(cp) => cp,
-            None => panic!("I don't have whom to send"),
-        };
+        let cp = self
+            .tuple()
+            .expect("tuple should exist when calling send()");
 
         // calculate checksum and length
         let builder = match cp {

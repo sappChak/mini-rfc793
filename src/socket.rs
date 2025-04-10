@@ -40,7 +40,7 @@ impl Socket {
     pub fn bind(&mut self, addr: SocketAddr) -> io::Result<()> {
         let tcb = Tcb::new(addr);
         let mut conns = self.mgr.connections();
-        match conns.bound.entry(addr.port()) {
+        match conns.bound_mut().entry(addr.port()) {
             Entry::Occupied(_) => {
                 return Err(io::Error::new(
                     io::ErrorKind::AddrInUse,
@@ -75,8 +75,8 @@ impl Socket {
     pub fn listen(&mut self) {
         let port = self.local_port();
         let mut conns = self.mgr.connections();
-        if let Some(tcb) = conns.bound.get_mut(&port) {
-            println!("listening on port {}", port);
+        if let Some(tcb) = conns.bound_mut().get_mut(&port) {
+            tracing::info!("listening on port {}", port);
             tcb.listen();
         }
     }
@@ -84,15 +84,18 @@ impl Socket {
     pub fn accept(&self) -> io::Result<Socket> {
         loop {
             let mut conns = self.mgr.connections();
-            while conns.pending.is_empty() {
+            while conns.pending_mut().is_empty() {
                 conns = self.mgr.pending_cvar().wait(conns).unwrap();
             }
-            if let Some(tcb) = conns.pending.pop_front() {
+            if let Some(tcb) = conns.pending_mut().pop_front() {
                 let tuple = match tcb.remote_addr() {
                     Some(remote_addr) => Tuple::new(tcb.listen_addr(), remote_addr),
                     None => panic!("shouldn't have happened!"),
                 };
-                conns.established.insert(tuple, tcb);
+                conns.established_mut().insert(tuple, tcb);
+
+                tracing::info!("accepted a connection from: {}", tuple.remote_port());
+
                 return Ok(Self {
                     mgr: self.mgr.clone(),
                     tuple,
@@ -104,7 +107,7 @@ impl Socket {
     pub fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let mut conns = self.mgr.connections();
         loop {
-            match conns.established.get_mut(&self.tuple) {
+            match conns.established_mut().get_mut(&self.tuple) {
                 Some(tcb) => {
                     if !tcb.rx_is_empty() {
                         return tcb.read(buf);
@@ -121,7 +124,7 @@ impl Socket {
 
     pub fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let mut conns = self.mgr.connections();
-        match conns.established.get_mut(&self.tuple) {
+        match conns.established_mut().get_mut(&self.tuple) {
             Some(tcb) => tcb.write(buf),
             None => Ok(0),
         }
@@ -129,7 +132,7 @@ impl Socket {
 
     pub fn close(&self) {
         let mut conns = self.mgr.connections();
-        if let Some(tcb) = conns.established.get_mut(&self.tuple) {
+        if let Some(tcb) = conns.established_mut().get_mut(&self.tuple) {
             tcb.init_closing()
         }
     }

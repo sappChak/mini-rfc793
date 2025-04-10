@@ -11,10 +11,10 @@ use crate::{
 };
 
 pub fn packet_loop(dev: &mut device::TunDevice, mgr: Arc<ConnectionManager>) -> io::Result<()> {
-    let mut buf = [0u8; TUN_MTU]; // MTU
+    let mut buf = [0u8; TUN_MTU as usize];
     loop {
         let mut conns = mgr.connections();
-        for tcb in conns.established.values_mut() {
+        for tcb in conns.established_mut().values_mut() {
             tcb.on_tick(dev)?;
         }
         drop(conns);
@@ -53,7 +53,7 @@ fn process_packet(
                 });
                 process_tcp_slice(dev, mgr.clone(), tcph, payload, tuple)?;
             }
-            Err(e) => println!("error parsing TCP segment {:?}", e),
+            Err(e) => tracing::warn!("error parsing TCP segment {:?}", e),
         }
     } else if let Ok(ipv6_hdr) = etherparse::Ipv6HeaderSlice::from_slice(pkt) {
         let src = ipv6_hdr.source_addr();
@@ -74,7 +74,7 @@ fn process_packet(
                 });
                 process_tcp_slice(dev, mgr.clone(), tcph, payload, tuple)?;
             }
-            Err(e) => println!("error parsing TCP segment {:?}", e),
+            Err(e) => tracing::warn!("error parsing TCP segment {:?}", e),
         }
     }
 
@@ -90,7 +90,7 @@ fn process_tcp_slice(
 ) -> io::Result<()> {
     let mut conns = mgr.connections();
 
-    match conns.established.entry(tuple) {
+    match conns.established_mut().entry(tuple) {
         Entry::Vacant(_) => {
             // it's likely, the connection was already initialized:
             if let Some(client) = conns.find_in_pending(tuple) {
@@ -99,9 +99,9 @@ fn process_tcp_slice(
                 return Ok(());
             }
             // connection wasn't initialized, try to establish one
-            if let Some(listener) = conns.bound.get_mut(&tuple.local_port()) {
+            if let Some(listener) = conns.bound_mut().get_mut(&tuple.local_port()) {
                 if let Some(client) = listener.try_establish(dev, &tcph, tuple)? {
-                    conns.pending.push_back(client);
+                    conns.pending_mut().push_back(client);
                 }
             }
         }
@@ -109,8 +109,8 @@ fn process_tcp_slice(
             if let Err(error) = o.get_mut().on_segment(dev, &tcph, payload, mgr.read_cvar()) {
                 match error.kind() {
                     io::ErrorKind::ConnectionRefused | io::ErrorKind::ConnectionReset => {
-                        println!("removing a connection: {:?}", &tuple);
-                        conns.established.remove(&tuple);
+                        tracing::info!("removing a connection: {:?}", &tuple);
+                        conns.established_mut().remove(&tuple);
                         mgr.read_cvar().notify_all();
                     }
                     _ => {}

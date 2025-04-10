@@ -10,8 +10,7 @@ pub mod tcb;
 
 pub mod tcp;
 
-/// TUN device MTU
-const TUN_MTU: usize = 1500;
+const TUN_MTU: u16 = 1500;
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 

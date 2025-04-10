@@ -1,5 +1,7 @@
 use tun_rs::{DeviceBuilder, SyncDevice};
 
+use crate::TUN_MTU;
+
 pub struct TunDevice {
     inner: SyncDevice,
 }
@@ -9,8 +11,10 @@ impl TunDevice {
         let dev = DeviceBuilder::new()
             .ipv4("10.0.0.1", 24, None)
             .ipv6("fd00:dead:beef::1", 64)
-            .mtu(1500)
+            .mtu(TUN_MTU)
             .build_sync()?;
+
+        tracing::info!("TUN device with name '{}' created", dev.name().unwrap());
 
         dev.set_nonblocking(true)?;
 
