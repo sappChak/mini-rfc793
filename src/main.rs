@@ -42,10 +42,10 @@ fn main() -> std::io::Result<()> {
         }
     });
 
-    let addr = "10.0.0.56:3001".parse().unwrap();
+    let addr = "[fd00:dead:beef::5]:8080".parse().unwrap();
     let listener = TcpListener::bind(addr, mgr.clone()).unwrap();
     while let Ok((stream, addr)) = listener.accept() {
-        println!("accepted a connection from address: {addr}");
+        println!("accepted a connection: {addr}");
         std::thread::spawn(move || handle_stream(stream, addr));
     }
 
