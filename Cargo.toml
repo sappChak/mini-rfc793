@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-tun = "0.7"
+tun-rs = "2"
 etherparse = "0.17"
 rand = "0.9"
 libc = "0.2"
