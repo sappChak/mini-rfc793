@@ -2,15 +2,8 @@
 
 This project is a minimal, custom implementation of the Transmission Control Protocol
 (TCP), as defined in [RFC 793](https://www.rfc-editor.org/rfc/rfc793.html), operating entirely in userspace. It leverages a TUN virtual
-network device to process IPv4 and IPv6 packets. The purpose of this project is purely
-educational.
-
-## Prerequisites
-
-- Administrative privileges to create and configure TUN devices.
-- Tools:
-  - `tcpdump`: Packet analyzer.
-  - `netcat`: Networking utility for testing.
+network device to process IPv4 and IPv6 packets. The purpose of this project is purely for
+self-education.
 
 ## Usage
 
@@ -37,7 +30,7 @@ Use `netcat` to establish a TCP connection to the server. The host portions and 
 up to you:
 
 ```bash
-nc -N 10.10.0.10 8080
+nc -N 10.0.0.10 8080
 ```
 
 or/both(as the program spawns 2 listeners):
