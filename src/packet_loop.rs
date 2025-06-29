@@ -13,11 +13,17 @@ use crate::{
 pub fn packet_loop(dev: &mut device::TunDevice, mgr: Arc<ConnectionManager>) -> io::Result<()> {
     let mut buf = [0u8; TUN_MTU as usize];
     loop {
-        let mut conns = mgr.connections();
-        for tcb in conns.established_mut().values_mut() {
-            tcb.on_tick(dev)?;
+        use nix::poll::{PollFd, PollFlags, PollTimeout};
+        let mut pfd = [PollFd::new(dev.as_fd(), PollFlags::POLLIN)];
+        let nready = nix::poll::poll(&mut pfd[..], PollTimeout::from(10u16)).unwrap();
+        // check timers and tx buffer if there is no incoming packet
+        if nready == 0 {
+            let mut conns = mgr.connections();
+            for tcb in conns.established_mut().values_mut() {
+                tcb.on_tick(dev)?;
+            }
+            continue;
         }
-        drop(conns);
         match dev.recv(&mut buf) {
             Ok(n) => {
                 let pkt = &buf[0..n];
