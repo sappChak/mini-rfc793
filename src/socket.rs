@@ -45,7 +45,7 @@ impl Socket {
                 return Err(io::Error::new(
                     io::ErrorKind::AddrInUse,
                     "port is already bound",
-                ))
+                ));
             }
             Entry::Vacant(vacant) => {
                 match self.tuple {
@@ -93,9 +93,7 @@ impl Socket {
                     None => panic!("shouldn't have happened!"),
                 };
                 conns.established_mut().insert(tuple, tcb);
-
                 tracing::info!("accepted a connection from: {}", tuple.remote_port());
-
                 return Ok(Self {
                     mgr: self.mgr.clone(),
                     tuple,

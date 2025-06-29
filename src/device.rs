@@ -1,3 +1,5 @@
+use std::os::fd::{AsFd, BorrowedFd};
+
 use tun_rs::{DeviceBuilder, SyncDevice};
 
 use crate::TUN_MTU;
@@ -19,6 +21,10 @@ impl TunDevice {
         dev.set_nonblocking(true)?;
 
         Ok(TunDevice { inner: dev })
+    }
+
+    pub fn as_fd(&self) -> BorrowedFd<'_> {
+        self.inner.as_fd()
     }
 
     pub fn send(&self, buf: &[u8]) -> std::io::Result<usize> {

@@ -6,8 +6,9 @@ use std::{
 };
 
 use crate::{
+    TUN_MTU,
     connections::{ConnectionManager, Tuple, TupleV4, TupleV6},
-    device, TUN_MTU,
+    device,
 };
 
 pub fn packet_loop(dev: &mut device::TunDevice, mgr: Arc<ConnectionManager>) -> io::Result<()> {

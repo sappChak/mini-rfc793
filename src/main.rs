@@ -3,23 +3,24 @@ use std::{net::SocketAddr, sync::Arc};
 use mini_tcp::{
     connections::ConnectionManager,
     device,
-    ip::packet_loop,
+    packet_loop::packet_loop,
     tcp::{TcpListener, TcpStream},
 };
 
 fn handle_stream(mut stream: TcpStream, addr: SocketAddr) -> std::io::Result<()> {
     let mut buffer = [0; 512];
+    let _ = stream.write(b"Hello from server!!!");
     loop {
         match stream.read(&mut buffer) {
             Ok(0) => {
-                println!("client {} disconnected!", addr);
+                println!("client {addr} disconnected!");
                 break;
             }
             Ok(n) => {
                 let received = String::from_utf8_lossy(&buffer[..n]);
-                println!("message received: {:?}", received);
+                println!("message received: {received:?}");
                 if let Err(e) = stream.write(b"extremely important response payload") {
-                    eprintln!("failed to send response, {:?}", e);
+                    eprintln!("failed to send response, {e:?}");
                     break;
                 };
             }
@@ -32,20 +33,20 @@ fn handle_stream(mut stream: TcpStream, addr: SocketAddr) -> std::io::Result<()>
 }
 
 fn main() -> std::io::Result<()> {
-    // init logging
-    tracing_subscriber::fmt().with_thread_ids(true).init();
+    use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
-    // create tun device
+    tracing_subscriber::registry()
+        .with(fmt::layer().with_thread_ids(true))
+        .with(EnvFilter::from_default_env())
+        .init();
+
     let mut dev = device::TunDevice::new().unwrap();
-
-    // create a manager which will store the connections
     let mgr = Arc::new(ConnectionManager::new());
 
-    // lauch the packet loop for processing incoming packets
     let mgr_ref = Arc::clone(&mgr);
     std::thread::spawn(move || {
         if let Err(e) = packet_loop(&mut dev, mgr_ref) {
-            eprintln!("error spawning thread: {}", e);
+            eprintln!("error spawning thread: {e:?}");
         }
     });
 

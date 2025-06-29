@@ -38,7 +38,7 @@ impl Tuple {
                 local: local_v6,
                 remote: remote_v6,
             }),
-            _ => panic!("Invalid address types: {} and {}", local, remote),
+            _ => panic!("Invalid address types: {local} and {remote}"),
         }
     }
 
