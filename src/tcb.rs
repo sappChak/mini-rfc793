@@ -1,14 +1,16 @@
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::VecDeque,
     io::{self},
     net::SocketAddr,
     sync::Condvar,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use crate::{
+    TUN_MTU,
     connections::{ConnectionType, Tuple},
-    device, TUN_MTU,
+    device,
+    timers::TimerManager,
 };
 
 /// TTL for IPv4
@@ -18,53 +20,11 @@ const HOP_LIMIT: u8 = 64;
 const QUEUE_LIMIT: usize = 1024;
 
 #[derive(Default)]
-struct TcpFlags {
+pub struct TcpFlags {
     syn: bool,
     fin: bool,
     psh: bool,
     rst: bool,
-}
-
-struct RTOEntry {
-    expires_at: Instant,
-    flags: TcpFlags,
-    payload_len: usize,
-}
-
-struct TimerManager {
-    rtos: BTreeMap<u32, RTOEntry>,
-}
-
-impl TimerManager {
-    pub fn new() -> Self {
-        Self {
-            rtos: BTreeMap::new(),
-        }
-    }
-
-    fn start_rto(&mut self, seq: u32, flags: TcpFlags, rto: Duration, payload_len: usize) {
-        self.rtos.insert(
-            seq,
-            RTOEntry {
-                expires_at: Instant::now() + rto,
-                flags,
-                payload_len,
-            },
-        );
-    }
-
-    fn cancel_rto(&mut self, seq: u32) -> Option<RTOEntry> {
-        self.rtos.remove(&seq)
-    }
-
-    fn find_expired_rto(&self) -> Option<(&u32, &RTOEntry)> {
-        let now = Instant::now();
-        self.rtos.iter().find(|(_, timer)| timer.expires_at <= now)
-    }
-
-    fn find_rto_by_ack(&mut self, seg_ack: u32) -> Option<(&u32, &RTOEntry)> {
-        self.rtos.iter().find(|(&seq, _)| seq <= seg_ack)
-    }
 }
 
 /// The state of a TCB
@@ -101,7 +61,7 @@ pub struct Tcb {
     rx_buffer: VecDeque<u8>,
     /// Initial seq number of sender
     iss: u32,
-    /// Last unacknowledged byte sent
+    /// Oldest unacknowledged byte sent
     snd_una: u32,
     /// Next seq number to be sent
     snd_nxt: u32,
@@ -211,7 +171,11 @@ impl Tcb {
         //              or RCV.NXT =< SEG.SEQ+SEG.LEN-1 < RCV.NXT+RCV.WND
         let seg_seq = hdr.sequence_number();
         let seg_len = Self::segment_length(hdr, len);
-        let seg_end = seg_seq.wrapping_add(seg_len - 1);
+        let seg_end = if seg_len > 0 {
+            seg_seq.wrapping_add(seg_len - 1)
+        } else {
+            seg_seq
+        };
         let rcv_win = self.rcv_nxt + self.rcv_wnd as u32;
 
         match (seg_len, self.rcv_wnd) {
@@ -316,17 +280,23 @@ impl Tcb {
         if !matches!(self.state, State::Estab | State::CloseWait | State::LastAck) {
             return Ok(());
         }
-        if let Some((&seq, _)) = self.timers.find_expired_rto() {
-            let timer = self.timers.cancel_rto(seq).unwrap();
+        if let Some((seq, timer)) = self.timers.find_expired() {
             let start = seq.wrapping_sub(self.snd_una) as usize;
             let end = start + timer.payload_len;
 
-            tracing::debug!("expired: local start_idx: {}, end_idx: {}", start, start);
+            assert!(start <= end);
+
+            tracing::debug!(
+                "expired: local start_idx: {}, end_idx: {}, tx_len: {}",
+                start,
+                end,
+                self.tx_buffer.len()
+            );
 
             let payload: Vec<u8> = self.tx_buffer.range(start..end).copied().collect();
 
             tracing::debug!(
-                "retransmitting: {:?}",
+                "retransmitting payload: {:?}",
                 String::from_utf8_lossy(payload.as_slice())
             );
 
@@ -380,8 +350,15 @@ impl Tcb {
                     Ok(_) => {
                         self.timers.start_rto(seq, flags, self.rto, seg_size);
                         seq = seq.wrapping_add(seg_size as u32);
+                        tracing::debug!(
+                            "sent segment: SEQ={}, ACK={:?}, size={}",
+                            seq,
+                            self.rcv_nxt,
+                            seg_size
+                        );
                     }
-                    Err(_) => {
+                    Err(e) => {
+                        tracing::debug!("error sending segment: {}", e);
                         break;
                     }
                 }
@@ -409,7 +386,7 @@ impl Tcb {
             self.send(dev, seq, Some(self.rcv_nxt), &flags, &[])?;
             // syn & fin take one seq number, so they can be retransmitted
             self.timers.start_rto(seq, flags, self.rto, 0);
-            self.snd_nxt += self.snd_nxt.wrapping_add(1);
+            self.snd_nxt = self.snd_nxt.wrapping_add(1);
         }
 
         Ok(())
@@ -503,12 +480,15 @@ impl Tcb {
                         self.tx_buffer.drain(..ack_idx.min(self.tx_buffer.len()));
                         self.snd_una = seg_ack;
 
-                        // cancel the retransmit timer associated with the snd_una
-                        if let Some((&seq, _)) = self.timers.find_rto_by_ack(seg_ack) {
-                            self.timers.cancel_rto(seq).unwrap();
+                        // cancel the retransmit timer/s associated with the snd_una
+                        self.timers.find_rto_by_ack(seg_ack, |seq, rto_entry| {
+                            tracing::debug!(
+                                "RTO for seq {} with payloa_len {} acked",
+                                seq,
+                                rto_entry.payload_len
+                            );
                             self.rto = Duration::from_millis(200);
-                            tracing::debug!("canceled RTO for: {}", seq);
-                        }
+                        });
 
                         // updating the window from send sequence space
                         if self.snd_wl1 < seg_seq
@@ -668,7 +648,7 @@ impl Tcb {
             match hdr.ack() {
                 true => return self.send_rst(dev, hdr.sequence_number()),
                 false => {
-                    return self.send_rst_ack(dev, hdr.sequence_number(), payload.len() as u32)
+                    return self.send_rst_ack(dev, hdr.sequence_number(), payload.len() as u32);
                 }
             }
         }
@@ -746,7 +726,7 @@ impl Tcb {
     ) -> io::Result<usize> {
         let cp = self
             .tuple()
-            .expect("tuple should exist when calling send()");
+            .expect("tuple has to exist when calling send()");
 
         // calculate checksum and length
         let builder = match cp {
@@ -766,10 +746,7 @@ impl Tcb {
         let mut datagram = Vec::<u8>::with_capacity(builder.size(payload.len()));
         match builder.write(&mut datagram, payload) {
             Ok(_) => dev.send(datagram.as_slice()),
-            Err(_) => Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "Packet serialization failed",
-            )),
+            Err(_) => Err(std::io::Error::other("Packet serialization failed")),
         }
     }
 }
