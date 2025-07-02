@@ -11,6 +11,7 @@ use crate::{
     device,
 };
 
+#[tracing::instrument(skip(dev, mgr))]
 pub fn packet_loop(dev: &mut device::TunDevice, mgr: Arc<ConnectionManager>) -> io::Result<()> {
     let mut buf = [0u8; TUN_MTU as usize];
     loop {
@@ -20,9 +21,18 @@ pub fn packet_loop(dev: &mut device::TunDevice, mgr: Arc<ConnectionManager>) -> 
         // check timers and tx buffer if there is no incoming packet
         if nready == 0 {
             let mut conns = mgr.connections();
-            for tcb in conns.established_mut().values_mut() {
-                tcb.on_tick(dev)?;
-            }
+            conns.established_mut().retain(|tuple, tcb| {
+                if let Err(e) = tcb.on_tick(dev) {
+                    tracing::warn!("failed for {:?}: {}", tuple, e);
+                    return true; // do not drop, even if send failed 
+                }
+                if tcb.is_closed() {
+                    tracing::debug!("removing tuple: {:?}", tuple);
+                    false
+                } else {
+                    true
+                }
+            });
             continue;
         }
         match dev.recv(&mut buf) {

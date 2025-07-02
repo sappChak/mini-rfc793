@@ -92,7 +92,7 @@ pub enum ConnectionType {
     Passive,
 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct Connections {
     /// Fully established connections
     established: HashMap<Tuple, Tcb>,
@@ -142,7 +142,7 @@ impl Connections {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct ConnectionManager {
     /// Mutex to protect the connections data structure
     connections: Mutex<Connections>,

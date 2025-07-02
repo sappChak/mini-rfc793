@@ -19,7 +19,7 @@ const HOP_LIMIT: u8 = 64;
 /// Limit for send's
 const QUEUE_LIMIT: usize = 1024;
 
-#[derive(Default)]
+#[derive(Default, Clone, Copy, Debug)]
 pub struct TcpFlags {
     syn: bool,
     fin: bool,
@@ -44,6 +44,7 @@ pub enum State {
 }
 
 /// Transmission Control Block
+#[derive(Debug)]
 pub struct Tcb {
     /// TCB state
     state: State,
@@ -282,7 +283,7 @@ impl Tcb {
         }
         if let Some((seq, timer)) = self.timers.find_expired() {
             let start = seq.wrapping_sub(self.snd_una) as usize;
-            let end = start + timer.payload_len;
+            let end = start + timer.payload_len();
 
             assert!(start <= end);
 
@@ -304,7 +305,7 @@ impl Tcb {
                 dev,
                 seq,
                 Some(self.rcv_nxt),
-                &timer.flags,
+                timer.flags(),
                 payload.as_slice(),
             )?;
 
@@ -312,7 +313,7 @@ impl Tcb {
             self.rto *= 2;
 
             self.timers
-                .start_rto(seq, timer.flags, self.rto, timer.payload_len);
+                .start_rto(seq, timer.flags().to_owned(), self.rto, timer.payload_len());
         } else if !self.tx_is_empty() {
             let available_wnd =
                 self.snd_wnd
@@ -485,7 +486,7 @@ impl Tcb {
                             tracing::debug!(
                                 "RTO for seq {} with payloa_len {} acked",
                                 seq,
-                                rto_entry.payload_len
+                                rto_entry.payload_len()
                             );
                             self.rto = Duration::from_millis(200);
                         });
@@ -538,6 +539,7 @@ impl Tcb {
                     // The only thing that can arrive in self state is a
                     // retransmission of the remote FIN.  Acknowledge it, and restart
                     // the 2 MSL timeout.
+                    self.state = State::Closed;
                 }
                 _ => {}
             }

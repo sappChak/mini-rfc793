@@ -94,6 +94,10 @@ impl Socket {
                 };
                 conns.established_mut().insert(tuple, tcb);
                 tracing::info!("accepted a connection from: {}", tuple.remote_port());
+                tracing::debug!(
+                    "number of established connections: {}",
+                    conns.established().len()
+                );
                 return Ok(Self {
                     mgr: self.mgr.clone(),
                     tuple,

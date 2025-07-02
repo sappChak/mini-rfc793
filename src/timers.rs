@@ -5,13 +5,28 @@ use std::{
 
 use crate::tcb::TcpFlags;
 
+#[derive(Debug)]
 pub struct RTOEntry {
-    pub expires_at: Instant,
-    pub flags: TcpFlags,
-    pub payload_len: usize,
+    expires_at: Instant,
+    flags: TcpFlags,
+    payload_len: usize,
 }
 
-#[derive(PartialEq, Eq)]
+impl RTOEntry {
+    pub fn expires_at(&self) -> Instant {
+        self.expires_at
+    }
+
+    pub fn flags(&self) -> &TcpFlags {
+        &self.flags
+    }
+
+    pub fn payload_len(&self) -> usize {
+        self.payload_len
+    }
+}
+
+#[derive(PartialEq, Eq, Debug)]
 struct HeapEntry {
     expires_at: Instant,
     seq: u32,
@@ -29,7 +44,7 @@ impl PartialOrd for HeapEntry {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct TimerManager {
     heap: BinaryHeap<HeapEntry>,
     timers: HashMap<u32, RTOEntry>,
